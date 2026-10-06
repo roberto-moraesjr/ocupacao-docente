@@ -1,0 +1,2166 @@
+<?php
+require_once __DIR__ . '/php/configs/db.php';
+require_once __DIR__ . '/php/configs/utils.php';
+require_once __DIR__ . '/php/configs/auth.php';
+
+$can_open_checklist = isAdmin() || isGestor() || isSecretaria() || isCRIPlus() || isBibliotecaria();
+
+/* 
+if (isCRI()) {
+    header("Location: php/views/dashboard_vendas.php");
+    exit;
+}
+*/
+
+if (isProfessor()) {
+    header("Location: php/views/agenda_professores.php");
+    exit;
+}
+
+if (!isset($_GET['ajax_render'])) {
+    include __DIR__ . '/php/components/header.php';
+    echo '<link rel="stylesheet" href="css/dashboard.css">';
+    echo '<link rel="stylesheet" href="css/metas_ah.css">';
+    echo '<link rel="stylesheet" href="css/substituicao.css">';
+    echo '<link rel="stylesheet" href="css/dashboard_ajax.css">';
+    echo '<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>';
+} else {
+    $prefix = '';
+}
+
+$today_date = date('Y-m-d');
+$count_prof = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM docente WHERE ativo = 1"))[0];
+$count_salas = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM ambiente"))[0];
+$count_turmas = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM turma WHERE ativo = 1"))[0];
+$count_turmas_andamento = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM turma WHERE ativo = 1 AND data_inicio <= '$today_date' AND data_fim >= '$today_date'"))[0];
+$count_turmas_futuras = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM turma WHERE ativo = 1 AND data_inicio > '$today_date'"))[0];
+$count_cursos = mysqli_fetch_row(mysqli_query($conn, "SELECT COUNT(*) FROM curso"))[0];
+
+$filtro_prof = $_GET['filtro_prof'] ?? 'alfabetica';
+$filtro_area = $_GET['filtro_area'] ?? '';
+$filtro_nome = $_GET['filtro_nome'] ?? '';
+$filtro_docente_id = $_GET['docente_id'] ?? '';
+$mes_sel = $_GET['mes_sel'] ?? date('Y-m');
+$filtro_tipo_curso = $_GET['tipo_curso'] ?? '';
+$primeiro_dia_mes = date('Y-m-01', strtotime($mes_sel . '-01'));
+$ultimo_dia_mes = date('Y-m-t', strtotime($mes_sel . '-01'));
+
+// Conta apenas as turmas que terão aula no mês selecionado
+$sql_count = "SELECT COUNT(DISTINCT a.id) FROM agenda a JOIN turma t ON a.turma_id = t.id JOIN curso c ON t.curso_id = c.id WHERE t.ativo = 1 AND t.data_inicio <= '$ultimo_dia_mes' AND t.data_fim >= '$primeiro_dia_mes'";
+if (!empty($filtro_docente_id)) {
+    $sql_count .= " AND a.docente_id = " . (int) $filtro_docente_id;
+}
+if (!empty($filtro_tipo_curso)) {
+    $sql_count .= " AND c.tipo = '" . mysqli_real_escape_string($conn, $filtro_tipo_curso) . "'";
+}
+$count_aulas = mysqli_fetch_row(mysqli_query($conn, $sql_count))[0];
+$total_dias_uteis = contarDiasUteisNoMes($primeiro_dia_mes, $ultimo_dia_mes);
+
+$where_clauses = [];
+if (!empty($filtro_docente_id)) {
+    $safe_did = (int) $filtro_docente_id;
+    $where_clauses[] = "id = $safe_did";
+}
+if (!empty($filtro_area)) {
+    $area_esc = mysqli_real_escape_string($conn, $filtro_area);
+    $where_clauses[] = "(area_conhecimento LIKE '%$area_esc%')";
+}
+
+// Lógica: Monta a consulta de professores. Se houver filtros, adiciona as cláusulas WHERE correspondentes.
+$prof_page = (int) ($_GET['prof_page'] ?? 1);
+$prof_limit = 5;
+$offset = ($prof_page - 1) * $prof_limit;
+
+$is_filtered = !empty($where_clauses);
+$where_sql = $is_filtered ? ' WHERE ativo = 1 AND ' . implode(' AND ', $where_clauses) : ' WHERE ativo = 1 ';
+$profs_query = mysqli_query($conn, "SELECT id, nome, area_conhecimento FROM docente $where_sql");
+
+$prof_resumo_temp = [];
+if ($profs_query) {
+    while ($d = mysqli_fetch_assoc($profs_query)) {
+        $did_tmp = (int) $d['id'];
+        $dias_ocup_mes_selecionado = calcularDiasOcupadosNoMes($conn, $did_tmp, $primeiro_dia_mes, $ultimo_dia_mes);
+        $prof_resumo_temp[] = [
+            'id' => $did_tmp,
+            'nome' => $d['nome'],
+            'area' => $d['area_conhecimento'],
+            'dias_ocupados_mes' => $dias_ocup_mes_selecionado
+        ];
+    }
+}
+
+// Ordenação padrão
+usort($prof_resumo_temp, function ($a, $b) use ($filtro_prof) {
+    if ($filtro_prof === 'mais_ocupado') {
+        if ($b['dias_ocupados_mes'] !== $a['dias_ocupados_mes']) {
+            return $b['dias_ocupados_mes'] - $a['dias_ocupados_mes'];
+        }
+    } elseif ($filtro_prof === 'mais_livre') {
+        if ($a['dias_ocupados_mes'] !== $b['dias_ocupados_mes']) {
+            return $a['dias_ocupados_mes'] - $b['dias_ocupados_mes'];
+        }
+    }
+    // Padrão ou fallback: Alfabética
+    return strcasecmp($a['nome'], $b['nome']);
+});
+
+$total_professores_filtered = count($prof_resumo_temp);
+$total_pages_prof = ceil($total_professores_filtered / $prof_limit);
+$prof_resumo_final = array_slice($prof_resumo_temp, $offset, $prof_limit);
+
+$prof_resumo = [];
+$ano_atual = date('Y', strtotime($mes_sel . '-01'));
+$meses_nomes_curtos = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+$meses_nomes_completos = [
+    'Janeiro',
+    'Fevereiro',
+    'Março',
+    'Abril',
+    'Maio',
+    'Junho',
+    'Julho',
+    'Agosto',
+    'Setembro',
+    'Outubro',
+    'Novembro',
+    'Dezembro'
+];
+
+foreach ($prof_resumo_final as $pr) {
+    $did_tmp = $pr['id'];
+    $ano_resumo = getDailyStatusForYear($conn, $did_tmp, $ano_atual);
+    $dias_livres = countFreeDays($ano_resumo);
+
+    // Calcula se os períodos (Manhã, Tarde, Noite) estão integralmente livres no ano para exibição de tags rápidas
+    $is_manha_free = true;
+    $is_tarde_free = true;
+    $is_noite_free = true;
+    $has_manha_work = false;
+    $has_tarde_work = false;
+    $has_noite_work = false;
+    foreach ($ano_resumo as $day => $d_data) {
+        if ($d_data['Manhã'] === 'Ocupado' || $d_data['Manhã'] === 'Reservado')
+            $is_manha_free = false;
+        if ($d_data['Tarde'] === 'Ocupado' || $d_data['Tarde'] === 'Reservado')
+            $is_tarde_free = false;
+        if ($d_data['Noite'] === 'Ocupado' || $d_data['Noite'] === 'Reservado')
+            $is_noite_free = false;
+
+        if ($d_data['Manhã'] === 'Livre')
+            $has_manha_work = true;
+        if ($d_data['Tarde'] === 'Livre')
+            $has_tarde_work = true;
+        if ($d_data['Noite'] === 'Livre')
+            $has_noite_work = true;
+    }
+    $is_manha_free = $is_manha_free && $has_manha_work;
+    $is_tarde_free = $is_tarde_free && $has_tarde_work;
+    $is_noite_free = $is_noite_free && $has_noite_work;
+
+    $prof_resumo[] = [
+        'id' => $did_tmp,
+        'nome' => $pr['nome'],
+        'area' => $pr['area'],
+        'annual_status' => $ano_resumo,
+        'dias_livres' => $dias_livres,
+        'free_periods' => [
+            'Manhã' => $is_manha_free,
+            'Tarde' => $is_tarde_free,
+            'Noite' => $is_noite_free
+        ]
+    ];
+}
+
+$selected_prof_nome = '';
+if (!empty($filtro_docente_id)) {
+    foreach ($prof_resumo as $p) {
+        if ($p['id'] == $filtro_docente_id) {
+            $selected_prof_nome = $p['nome'];
+            break;
+        }
+    }
+    if (empty($selected_prof_nome)) {
+        $p_query = mysqli_query($conn, "SELECT nome FROM docente WHERE id = " . (int) $filtro_docente_id);
+        if ($p_data = mysqli_fetch_assoc($p_query)) {
+            $selected_prof_nome = $p_data['nome'];
+        }
+    }
+}
+
+$areas_query = mysqli_query($conn, "SELECT DISTINCT area_conhecimento FROM docente WHERE ativo = 1 AND area_conhecimento IS NOT
+    NULL AND area_conhecimento != '' ORDER BY area_conhecimento ASC");
+$areas_raw = mysqli_fetch_all($areas_query, MYSQLI_ASSOC);
+// Extrai áreas únicas (suporta docentes com múltiplas áreas separadas por vírgula)
+$unique_areas = [];
+foreach ($areas_raw as $ar) {
+    $parts = array_map('trim', explode(',', $ar['area_conhecimento']));
+    foreach ($parts as $p) {
+        if (!empty($p) && !in_array($p, $unique_areas)) {
+            $unique_areas[] = $p;
+        }
+    }
+}
+sort($unique_areas);
+$areas_list = array_map(function ($a) {
+    return ['area_conhecimento' => $a];
+}, $unique_areas);
+
+// --- Turmas Encerradas (Últimos 7 dias) ---
+$data_7_atras = date('Y-m-d', strtotime('-7 days'));
+$sql_enc = "
+    SELECT t.id, t.sigla, c.nome AS curso_nome, t.data_fim,
+           COALESCE(NULLIF(TRIM(t.local), ''), NULLIF(TRIM(amb.cidade), '')) AS cidade,
+           t.dias_semana, t.horario_inicio, t.horario_fim,
+           d1.nome as prof1, d2.nome as prof2, d3.nome as prof3, d4.nome as prof4,
+           tc.coordenacao_diario_entregue_secretaria
+    FROM turma t 
+    JOIN curso c ON t.curso_id = c.id
+    LEFT JOIN ambiente amb ON t.ambiente_id = amb.id
+    LEFT JOIN docente d1 ON t.docente_id1 = d1.id
+    LEFT JOIN docente d2 ON t.docente_id2 = d2.id
+    LEFT JOIN docente d3 ON t.docente_id3 = d3.id
+    LEFT JOIN docente d4 ON t.docente_id4 = d4.id
+    LEFT JOIN turma_checklists tc ON t.id = tc.turma_id
+    WHERE t.ativo = 1 AND t.data_fim BETWEEN '$data_7_atras' AND '" . date('Y-m-d') . "'";
+if (!empty($filtro_tipo_curso)) {
+    $sql_enc .= " AND c.tipo = '" . mysqli_real_escape_string($conn, $filtro_tipo_curso) . "'";
+}
+$sql_enc .= " ORDER BY t.data_fim DESC";
+$encerradas_query = mysqli_query($conn, $sql_enc);
+$encerradas = mysqli_fetch_all($encerradas_query, MYSQLI_ASSOC);
+
+// --- Próximas Turmas (Intervalo fixo de 30 dias com paginação de lista) ---
+$proximas_page = (int) ($_GET['proximas_page'] ?? 1);
+$proximas_limit = 10; // Mostra 10 por página conforme imagem de referência
+$proximas_start = date('Y-m-d');
+$proximas_end = date('Y-m-d', strtotime("+30 days"));
+
+$sql_prox = "
+    SELECT t.id, t.sigla,
+           COALESCE(NULLIF(TRIM(t.local), ''), NULLIF(TRIM(amb.cidade), '')) AS cidade,
+           c.nome AS curso_nome, t.data_inicio, t.tipo,
+           t.dias_semana, t.horario_inicio, t.horario_fim,
+           d1.nome as prof1, d2.nome as prof2, d3.nome as prof3, d4.nome as prof4,
+           tc.opp_reprografia_solicitada
+    FROM turma t 
+    JOIN curso c ON t.curso_id = c.id 
+    LEFT JOIN ambiente amb ON t.ambiente_id = amb.id
+    LEFT JOIN docente d1 ON t.docente_id1 = d1.id
+    LEFT JOIN docente d2 ON t.docente_id2 = d2.id
+    LEFT JOIN docente d3 ON t.docente_id3 = d3.id
+    LEFT JOIN docente d4 ON t.docente_id4 = d4.id
+    LEFT JOIN turma_checklists tc ON t.id = tc.turma_id
+    WHERE t.data_inicio BETWEEN '$proximas_start' AND '$proximas_end'
+      AND t.ativo = 1";
+if (!empty($filtro_tipo_curso)) {
+    $sql_prox .= " AND c.tipo = '" . mysqli_real_escape_string($conn, $filtro_tipo_curso) . "'";
+}
+$sql_prox .= " ORDER BY t.data_inicio ASC LIMIT 100";
+$proximas_query = mysqli_query($conn, $sql_prox);
+
+$all_proximas = [];
+if ($proximas_query) {
+    while ($row = mysqli_fetch_assoc($proximas_query)) {
+        $tid = (int) $row['id'];
+        // Tenta achar a primeira aula real no futuro
+        $agenda_res = mysqli_query($conn, "SELECT MIN(data) as fd FROM agenda WHERE turma_id = $tid AND data >= '$proximas_start'");
+        $agenda_row = mysqli_fetch_assoc($agenda_res);
+
+        // Se tiver agenda, usa a data da agenda, senão usa a data de início oficial
+        $data_final = (!empty($agenda_row['fd'])) ? $agenda_row['fd'] : $row['data_inicio'];
+
+        // Se cair num domingo, joga para segunda (regra de negócio aparente)
+        if (date('w', strtotime($data_final)) == 0) {
+            $data_final = date('Y-m-d', strtotime($data_final . ' +1 day'));
+        }
+
+        $row['data_inicio_real'] = $data_final;
+
+        // Só adiciona se a data de início REAL for a partir de hoje
+        if ($data_final >= $proximas_start && $data_final <= $proximas_end) {
+            $all_proximas[] = $row;
+        }
+    }
+}
+usort($all_proximas, function ($a, $b) {
+    return strcmp($a['data_inicio_real'], $b['data_inicio_real']);
+});
+
+$total_proximas_items = count($all_proximas);
+$total_proximas_pages = ceil($total_proximas_items / $proximas_limit);
+$proximas_page = max(1, min($proximas_page, $total_proximas_pages ?: 1));
+$offset_proximas = ($proximas_page - 1) * $proximas_limit;
+$proximas = array_slice($all_proximas, $offset_proximas, $proximas_limit);
+
+// --- Turmas Encerrando (Próximos 7 dias) ---
+$data_hoje = date('Y-m-d');
+$data_7dias = date('Y-m-d', strtotime('+7 days'));
+$sql_ence = "
+    SELECT t.id, t.sigla, c.nome AS curso_nome, t.data_fim,
+           COALESCE(NULLIF(TRIM(t.local), ''), NULLIF(TRIM(amb.cidade), '')) AS cidade,
+           t.dias_semana, t.horario_inicio, t.horario_fim,
+           d1.nome as prof1, d2.nome as prof2, d3.nome as prof3, d4.nome as prof4,
+           tc.coordenacao_fichas_entregues_secretaria
+    FROM turma t 
+    JOIN curso c ON t.curso_id = c.id
+    LEFT JOIN ambiente amb ON t.ambiente_id = amb.id
+    LEFT JOIN docente d1 ON t.docente_id1 = d1.id
+    LEFT JOIN docente d2 ON t.docente_id2 = d2.id
+    LEFT JOIN docente d3 ON t.docente_id3 = d3.id
+    LEFT JOIN docente d4 ON t.docente_id4 = d4.id
+    LEFT JOIN turma_checklists tc ON t.id = tc.turma_id
+    WHERE t.ativo = 1 AND t.data_fim BETWEEN '$data_hoje' AND '$data_7dias'";
+if (!empty($filtro_tipo_curso)) {
+    $sql_ence .= " AND c.tipo = '" . mysqli_real_escape_string($conn, $filtro_tipo_curso) . "'";
+}
+$sql_ence .= " ORDER BY t.data_fim ASC";
+$encerrando_query = mysqli_query($conn, $sql_ence);
+$encerrando = mysqli_fetch_all($encerrando_query, MYSQLI_ASSOC);
+
+// --- Turmas Iniciadas (Últimos 5 dias) ---
+$data_5_atras = date('Y-m-d', strtotime('-5 days'));
+$sql_ini = "
+    SELECT t.id, t.sigla, c.nome AS curso_nome, t.data_inicio,
+           COALESCE(NULLIF(TRIM(t.local), ''), NULLIF(TRIM(amb.cidade), '')) AS cidade,
+           t.dias_semana, t.horario_inicio, t.horario_fim,
+           d1.nome as prof1, d2.nome as prof2, d3.nome as prof3, d4.nome as prof4,
+           tc.coordenacao_fichas_entregues_secretaria
+    FROM turma t 
+    JOIN curso c ON t.curso_id = c.id
+    LEFT JOIN ambiente amb ON t.ambiente_id = amb.id
+    LEFT JOIN docente d1 ON t.docente_id1 = d1.id
+    LEFT JOIN docente d2 ON t.docente_id2 = d2.id
+    LEFT JOIN docente d3 ON t.docente_id3 = d3.id
+    LEFT JOIN docente d4 ON t.docente_id4 = d4.id
+    LEFT JOIN turma_checklists tc ON t.id = tc.turma_id
+    WHERE t.ativo = 1 AND t.data_inicio BETWEEN '$data_5_atras' AND '$data_hoje'";
+if (!empty($filtro_tipo_curso)) {
+    $sql_ini .= " AND c.tipo = '" . mysqli_real_escape_string($conn, $filtro_tipo_curso) . "'";
+}
+$sql_ini .= " ORDER BY t.data_inicio DESC";
+$iniciadas_query = mysqli_query($conn, $sql_ini);
+$iniciadas = mysqli_fetch_all($iniciadas_query, MYSQLI_ASSOC);
+
+$cores = ['#e53935', '#1976d2', '#388e3c', '#ff8f00', '#9c27b0', '#00838f', '#6d4c41'];
+?>
+
+<div class="focus-overlay" id="focus-overlay" onclick="toggleFocusMode(null)"></div>
+
+<div class="dashboard-content-ajax" id="dashboard-ajax-content">
+    <script>
+        (function () {
+            var isSecretaria = <?= isSecretaria() ? 'true' : 'false' ?>;
+            var mode = isSecretaria ? 'turmas' : (localStorage.getItem('dashboard_view_mode') || 'geral');
+            var container = document.getElementById('dashboard-ajax-content');
+            if (container) {
+                container.className = 'dashboard-content-ajax view-mode-' + mode;
+                container.style.opacity = '1';
+            }
+        })();
+    </script>
+    <div class="welcome-banner animate-fade-in">
+        <div class="welcome-date"><i class="bi bi-calendar3"></i>
+            <?= date('d/m/Y') ?>
+        </div><br>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h2><i class="bi bi-speedometer2"></i> Dashboard — Gestão Escolar SENAI</h2><br>
+                <p>Visão geral do sistema com turmas, professores, ambientes e agenda.</p>
+            </div>
+        </div>
+        <?php if (!isSecretaria()): ?>
+            <div class="header-action-group"
+                style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 30px; justify-items: end; margin-left: auto; width: fit-content;">
+                <button class="btn btn-primary" onclick="openWorkloadModal()"
+                    style="background: #6a1b9a; border-color: #4a148c; box-shadow: 0 4px 10px rgba(106, 27, 154, 0.2); font-weight: 700; width: 100%;">
+                    <i class="fas fa-business-time"></i> <span class="hide-mobile">Carga Horária
+                        Docentes</span><span class="show-mobile">Carga H.</span>
+                </button>
+                <button class="btn btn-primary" onclick="openProducaoModal()"
+                    style="background: #1976d2; border-color: #1565c0; box-shadow: 0 4px 10px rgba(25, 118, 210, 0.2); font-weight: 700; width: 100%;">
+                    <i class="fas fa-chart-line"></i> <span class="hide-mobile">Produção Aluno/Hora</span><span
+                        class="show-mobile">Prod. A/H</span>
+                </button>
+                <button class="btn btn-primary" onclick="openRessarcimentoModal()"
+                    style="background: #388e3c; border-color: #2e7d32; box-shadow: 0 4px 10px rgba(56, 142, 60, 0.2); font-weight: 700; width: 100%;">
+                    <i class="fas fa-hand-holding-usd"></i> <span class="hide-mobile">Métricas de
+                        Ressarcimento</span><span class="show-mobile">Ressarc.</span>
+                </button>
+
+                <?php if (!isCRI()): ?>
+                    <button class="btn btn-primary" onclick="openSubstituicaoModal()"
+                        style="background: #1565c0; border-color: #0d47a1; box-shadow: 0 4px 10px rgba(21, 101, 192, 0.2); font-weight: 700; width: 100%;">
+                        <i class="fas fa-user-friends"></i> <span class="hide-mobile">Professores
+                            Disponíveis</span><span class="show-mobile">Subst.</span>
+                    </button>
+                <?php else: ?>
+                    <div></div> <!-- Placeholder para manter o grid se não for CRI -->
+                <?php endif; ?>
+
+                <button class="btn btn-primary" onclick="openDespesasModal()"
+                    style="background: #e65100; border-color: #ef6c00; box-shadow: 0 4px 10px rgba(230, 81, 0, 0.2); font-weight: 700; width: 100%;">
+                    <i class="fas fa-money-bill-wave"></i> <span class="hide-mobile">Previsão de
+                        Despesas</span><span class="show-mobile">Despesas</span>
+                </button>
+                <button class="btn btn-primary" onclick="openReportSelectProfModal()"
+                    style="background: #607d8b; border-color: #455a64; box-shadow: 0 4px 10px rgba(96, 125, 139, 0.2); font-weight: 700; width: 100%;">
+                    <i class="fas fa-file-invoice"></i> <span class="hide-mobile">Relatório Mensal</span><span
+                        class="show-mobile">Relat.</span>
+                </button>
+                <button class="btn btn-primary" onclick="initMetasAH()"
+                    style="grid-column: span 3; background: #00897b; border-color: #00796b; box-shadow: 0 4px 10px rgba(0, 137, 123, 0.2); font-weight: 700; width: 100%; margin-top: 5px;">
+                    <i class="fas fa-bullseye"></i> <span class="hide-mobile">META A/H</span><span
+                        class="show-mobile">META</span>
+                </button>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <?php if (!isSecretaria()): ?>
+        <div class="stats-grid">
+            <?php
+            $stats = [
+                ['Professores', $count_prof, 'fa-chalkboard-teacher', 'var(--primary-red)', 'php/views/professores.php', 'Gerenciar'],
+                ['Ambientes', $count_salas, 'fa-door-open', '#1976d2', 'php/views/salas.php', 'Gerenciar'],
+                ['Turmas Total', $count_turmas, 'fa-users', '#388e3c', 'php/views/turmas.php', 'Gerenciar'],
+                ['Turmas em Andamento', $count_turmas_andamento, 'fa-play-circle', '#00897b', 'php/views/turmas.php?status=andamento', 'Gerenciar'],
+                ['Turmas Futuras', $count_turmas_futuras, 'fa-clock', '#0288d1', 'php/views/turmas.php?status=futura', 'Gerenciar'],
+                ['Cursos', $count_cursos, 'fa-graduation-cap', '#ff8f00', 'php/views/cursos.php', 'Gerenciar'],
+                ['Aulas Agendadas', $count_aulas, 'fa-calendar-check', '#9c27b0', 'php/views/agenda_professores.php', 'Visualizar'],
+            ];
+            $i = 1;
+            foreach ($stats as $s):
+                $link_url = $prefix . $s[4];
+                $base_view_path = explode('?', $s[4])[0];
+                $is_restricted = isCRI() && in_array($base_view_path, ['php/views/professores.php', 'php/views/salas.php', 'php/views/turmas.php', 'php/views/cursos.php']);
+                $click_handler = $is_restricted ? '' : "onclick=\"location.href='$link_url'\"";
+                $cursor_style = $is_restricted ? 'cursor: default;' : 'cursor: pointer;';
+                ?>
+                <div class="stat-card animate-fade-in delay-<?= $i++ ?> shimmer-hover" <?= $click_handler ?> style="
+                <?= $cursor_style ?>">
+                    <div class="stat-icon" style="background: <?= $s[3] ?>1a; color: <?= $s[3] ?>;">
+                        <i class="fas <?= $s[2] ?>"></i>
+                    </div>
+                    <div class="stat-number">
+                        <?= $s[1] ?>
+                    </div>
+                    <div class="stat-label">
+                        <?= $s[0] ?>
+                    </div>
+                    <?php if (!$is_restricted): ?>
+                        <a href="<?= $link_url ?>" class="stat-link" style="color: <?= $s[3] ?>;">
+                            <?= $s[5] ?> <i class="fas fa-arrow-right"></i>
+                        </a>
+                    <?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+
+    <?php if (!isSecretaria()): ?>
+        <div class="dashboard-toggle-buttons"
+            style="display: flex; gap: 8px; margin-bottom: 15px; justify-content: space-between; align-items: center; flex-wrap: wrap; width: 100%;">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button type="button" id="btn-toggle-turmas" onclick="setDashboardViewMode('turmas')" class="btn-toggle-view"
+                    title="Ver Informações das Turmas">
+                    <i class="fas fa-info-circle"></i> Ver Informações das Turmas
+                </button>
+                <button type="button" id="btn-toggle-timeline" onclick="setDashboardViewMode('timeline')"
+                    class="btn-toggle-view" title="Ver Resumo Anual dos Professores">
+                    <i class="fas fa-stream"></i> Ver Resumo Anual dos Professores
+                </button>
+                <button type="button" id="btn-toggle-geral" onclick="setDashboardViewMode('geral')" class="btn-toggle-view"
+                    title="Visualização Geral">
+                    <i class="fas fa-th-large"></i> Visualização Geral
+                </button>
+            </div>
+
+            <!-- Filtro por Tipo de Curso (FIC, CAI, CT) -->
+            <div class="tipo-curso-filter" style="display: flex; align-items: center; gap: 6px; background: var(--card-bg); padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-sm);">
+                <span style="font-size: 0.75rem; font-weight: 800; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-right: 5px;">
+                    <i class="fas fa-filter"></i> Curso:
+                </span>
+                <button type="button" onclick="setTipoCursoFilter('')" class="btn-toggle-view <?= empty($filtro_tipo_curso) ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">Todos</button>
+                <button type="button" onclick="setTipoCursoFilter('FIC')" class="btn-toggle-view <?= $filtro_tipo_curso === 'FIC' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">FIC</button>
+                <button type="button" onclick="setTipoCursoFilter('CAI')" class="btn-toggle-view <?= $filtro_tipo_curso === 'CAI' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">CAI</button>
+                <button type="button" onclick="setTipoCursoFilter('CT')" class="btn-toggle-view <?= $filtro_tipo_curso === 'CT' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">CT</button>
+            </div>
+        </div>
+
+        <div class="card"
+            style="margin-bottom: 20px; background: var(--card-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 12px;">
+            <form method="GET" action="index.php" id="dashboard-filter-form"
+                style="display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap;">
+                <div style="display: flex; gap: 15px; align-items: flex-end; flex: 1; flex-wrap: wrap;">
+
+                    <div class="btn-prof-container" style="display: flex; flex-direction: column; gap: 10px;">
+                        <label
+                            style="font-weight: 700; font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Professor
+                            Selecionado</label>
+                        <button type="button" class="btn btn-primary" id="btn-selecionar-professor"
+                            style="background: <?= !empty($filtro_docente_id) ? '#2e7d32' : '#ed1c16' ?>; border-color: <?= !empty($filtro_docente_id) ? '#1b5e20' : '#ed1c16' ?>; padding: 10px 24px; font-weight: 700; border-radius: 8px; display: flex; align-items: center; gap: 10px; height: 42px;">
+                            <i class="fas fa-user-plus"></i>
+                            <span id="btn-prof-label">
+                                <?= !empty($selected_prof_nome) ? htmlspecialchars($selected_prof_nome) : 'Selecionar Professor' ?>
+                            </span>
+                        </button>
+                        <input type="hidden" name="docente_id" id="dashboard-docente-id"
+                            value="<?= htmlspecialchars($filtro_docente_id) ?>">
+                        <input type="hidden" name="tipo_curso" id="tipo_curso_hidden"
+                            value="<?= htmlspecialchars($filtro_tipo_curso) ?>">
+                    </div>
+
+                    <?php if (!empty($filtro_docente_id)): ?>
+                        <button type="button" onclick="clearTeacherFilter()" class="btn btn-export btn-clear-container"
+                            style="height: 42px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border-radius: 8px; background: var(--bg-color); border: 1px solid var(--border-color); color: var(--text-color); padding: 0 15px; font-weight: 600; font-size: 0.85rem; cursor: pointer;">
+                            <i class="fas fa-times"></i> Limpar Seleção
+                        </button>
+
+                        <?php
+                        $hoje = date('Y-m-d');
+                        $fim_ano = date('Y-12-31');
+                        $inicio_ano = date('Y-01-01');
+                        $total_ano = calculateTeacherYearlyWorkload($conn, (int) $filtro_docente_id, $inicio_ano, $fim_ano);
+                        $saldo_remanescente = calculateTeacherYearlyWorkload($conn, (int) $filtro_docente_id, $hoje, $fim_ano);
+                        $porcentagem = ($total_ano > 0) ? round(($saldo_remanescente / $total_ano) * 100) : 0;
+                        ?>
+                        <div id="individual-workload-container" class="individual-workload-wrapper"
+                            style="display: flex; flex-direction: column; gap: 4px; min-width: 200px; padding-left: 10px; border-left: 2px solid var(--border-color);">
+                            <div
+                                style="display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; font-weight: 700; color: var(--text-color);">
+                                <span>Horas Disponíveis (Ano)</span>
+                                <span style="color: #2e7d32; margin-left: 10px;">
+                                    <?= round($saldo_remanescente - calculateConsumedHours($conn, (int) $filtro_docente_id, $hoje, $fim_ano, false)) ?>h
+                                    /
+                                    <?= round($total_ano) ?>h
+                                </span>
+                            </div>
+                            <div style="width: 100%; height: 8px; background: rgba(0,0,0,0.1); border-radius: 10px; overflow: hidden; position: relative;"
+                                title="<?= $porcentagem ?>% de carga horária disponível (Cálculo deduz feriados, férias, planejamento e afastamentos)">
+                                <div
+                                    style="width: <?= $porcentagem ?>%; height: 100%; background: linear-gradient(90deg, #2e7d32, #4caf50); transition: width 1s ease-in-out;">
+                                </div>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <div class="month-nav-container"
+                    style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
+                    <label
+                        style="font-weight: 700; font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Navegação
+                        por Mês</label>
+                    <div
+                        style="display: flex; align-items: center; gap: 15px; background: var(--bg-color); padding: 5px 10px; border-radius: 50px; border: 1px solid var(--border-color); box-shadow: 0 2px 8px rgba(0,0,0,0.05); height: 42px;">
+                        <button type="button" onclick="navigateDashboardMonth(-1)" class="month-btn-nav"
+                            style="width:30px;height:30px; color:var(--text-color); border:none; display: flex; align-items: center; justify-content: center; background: var(--card-bg); border-radius: 50%; border: 1px solid var(--border-color); cursor:pointer; transition: all 0.2s;"><i
+                                class="fas fa-chevron-left" style="font-size:0.75rem;"></i></button>
+                        <span id="dashboard-month-label"
+                            style="font-weight: 800; font-size: 0.9rem; min-width: 140px; text-align: center; text-transform: capitalize; color: var(--text-color);">
+                            <?= $meses_nomes_completos[(int) date('m', strtotime($mes_sel . '-01')) - 1] . ' ' . date('Y', strtotime($mes_sel . '-01')) ?>
+                        </span>
+                        <button type="button" onclick="navigateDashboardMonth(1)" class="month-btn-nav"
+                            style="width:30px;height:30px; color:var(--text-color); border:none; display: flex; align-items: center; justify-content: center; background: var(--card-bg); border-radius: 50%; border: 1px solid var(--border-color); cursor:pointer; transition: all 0.2s;"><i
+                                class="fas fa-chevron-right" style="font-size:0.75rem;"></i></button>
+                    </div>
+                    <input type="hidden" name="mes_sel" id="mes_sel_hidden" value="<?= $mes_sel ?>">
+                    <input type="hidden" name="filtro_area" id="filtro_area_hidden"
+                        value="<?= htmlspecialchars($filtro_area) ?>">
+                    <input type="hidden" name="proximas_page" id="proximas_page_hidden" value="<?= $proximas_page ?>">
+                    <input type="hidden" name="prof_page" id="prof_page_hidden" value="<?= $prof_page ?>">
+                </div>
+            </form>
+        </div>
+    <?php else: ?>
+        <div class="dashboard-toggle-buttons"
+            style="display: flex; gap: 8px; margin-bottom: 20px; justify-content: space-between; align-items: center; flex-wrap: wrap; width: 100%;">
+            <div style="font-weight: 700; font-size: 0.95rem; color: var(--text-color); display: flex; align-items: center; gap: 8px;">
+                <i class="fas fa-layer-group" style="color: var(--primary-red);"></i> Visão Geral das Turmas
+            </div>
+            <!-- Filtro por Tipo de Curso (FIC, CAI, CT) -->
+            <div class="tipo-curso-filter" style="display: flex; align-items: center; gap: 6px; background: var(--card-bg); padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: var(--shadow-sm);">
+                <span style="font-size: 0.75rem; font-weight: 800; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-right: 5px;">
+                    <i class="fas fa-filter"></i> Curso:
+                </span>
+                <button type="button" onclick="setTipoCursoFilter('')" class="btn-toggle-view <?= empty($filtro_tipo_curso) ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">Todos</button>
+                <button type="button" onclick="setTipoCursoFilter('FIC')" class="btn-toggle-view <?= $filtro_tipo_curso === 'FIC' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">FIC</button>
+                <button type="button" onclick="setTipoCursoFilter('CAI')" class="btn-toggle-view <?= $filtro_tipo_curso === 'CAI' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">CAI</button>
+                <button type="button" onclick="setTipoCursoFilter('CT')" class="btn-toggle-view <?= $filtro_tipo_curso === 'CT' ? 'active' : '' ?>" style="padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; cursor: pointer; transition: all 0.2s;">CT</button>
+            </div>
+        </div>
+
+        <form method="GET" action="index.php" id="dashboard-filter-form" style="display: none;">
+            <input type="hidden" name="tipo_curso" id="tipo_curso_hidden" value="<?= htmlspecialchars($filtro_tipo_curso) ?>">
+            <input type="hidden" name="docente_id" id="dashboard-docente-id" value="<?= htmlspecialchars($filtro_docente_id) ?>">
+            <input type="hidden" name="mes_sel" id="mes_sel_hidden" value="<?= $mes_sel ?>">
+            <input type="hidden" name="filtro_area" id="filtro_area_hidden" value="<?= htmlspecialchars($filtro_area) ?>">
+            <input type="hidden" name="proximas_page" id="proximas_page_hidden" value="<?= $proximas_page ?>">
+            <input type="hidden" name="prof_page" id="prof_page_hidden" value="<?= $prof_page ?>">
+        </form>
+    <?php endif; ?>
+
+    <?php if (!isSecretaria() && !empty($areas_list)): ?>
+        <div class="area-filter-bar"
+            style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; padding: 16px 20px; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; align-items: center;">
+            <span
+                style="font-weight: 800; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-right: 8px; display: flex; align-items: center; gap: 6px;">
+                <i class="fas fa-filter"></i> Filtrar por Área:
+            </span>
+            <a href="#"
+                onclick="document.getElementById('filtro_area_hidden').value = ''; document.getElementById('prof_page_hidden').value = 1; navigateDashboardMonth(0); return false;"
+                class="area-filter-btn <?= empty($filtro_area) ? 'active' : '' ?>"
+                style="padding: 7px 18px; border-radius: 20px; font-size: 0.8rem; font-weight: 700; text-decoration: none; transition: all 0.25s ease; border: 1.5px solid <?= empty($filtro_area) ? 'var(--primary-red)' : 'var(--border-color)' ?>; background: <?= empty($filtro_area) ? 'var(--primary-red)' : 'var(--card-bg)' ?>; color: <?= empty($filtro_area) ? '#fff' : 'var(--text-color)' ?>; cursor: pointer;">
+                Todos
+            </a>
+            <?php foreach ($areas_list as $al):
+                $area_val = $al['area_conhecimento'];
+                $is_active = ($filtro_area === $area_val);
+                // Conta docentes nessa área
+                $area_count_esc = mysqli_real_escape_string($conn, $area_val);
+                $area_count_q = mysqli_query($conn, "SELECT COUNT(*) as c FROM docente WHERE ativo = 1 AND area_conhecimento LIKE '%$area_count_esc%'");
+                $area_count = mysqli_fetch_assoc($area_count_q)['c'];
+                ?>
+                <a href="#"
+                    onclick="document.getElementById('filtro_area_hidden').value = '<?= addslashes($area_val) ?>'; document.getElementById('prof_page_hidden').value = 1; navigateDashboardMonth(0); return false;"
+                    class="area-filter-btn <?= $is_active ? 'active' : '' ?>"
+                    style="padding: 7px 18px; border-radius: 20px; font-size: 0.8rem; font-weight: 700; text-decoration: none; transition: all 0.25s ease; border: 1.5px solid <?= $is_active ? 'var(--primary-red)' : 'var(--border-color)' ?>; background: <?= $is_active ? 'var(--primary-red)' : 'var(--card-bg)' ?>; color: <?= $is_active ? '#fff' : 'var(--text-color)' ?>; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                    <?= htmlspecialchars($area_val) ?>
+                    <span
+                        style="background: <?= $is_active ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.08)' ?>; padding: 1px 7px; border-radius: 10px; font-size: 0.7rem;">
+                        <?= $area_count ?>
+                    </span>
+                </a>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+
+    <div class="dashboard-grid" <?= isSecretaria() ? 'style="grid-template-columns: 1fr; max-width: 1400px; margin: 0 auto;"' : '' ?>>
+        <?php if (!isSecretaria()): ?>
+            <div class="dash-section allow-overflow">
+                <div class="dash-section-header dash-section-header-sticky"
+                    style="justify-content: space-between; display: flex; align-items: center; padding-bottom: 15px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;">
+                    <h3
+                        style="display: flex; align-items: center; gap: 10px; margin: 0; font-size: 1.1rem; flex-wrap: wrap;">
+                        <i class="fas fa-users" style="color: var(--primary-red);"></i> Resumo Anual de Horários
+                        <div
+                            style="display: inline-flex; align-items: center; gap: 8px; margin-left: 15px; background: rgba(0,0,0,0.05); padding: 4px 8px; border-radius: 20px;">
+                            <button type="button" onclick="navigateDashboardMonth(-12)" title="Ano Anterior"
+                                style="border: none; background: transparent; cursor: pointer; color: var(--text-color);"><i
+                                    class="fas fa-chevron-left" style="font-size: 0.8rem;"></i></button>
+                            <span style="font-weight: 800; font-size: 0.9rem; color: var(--primary-red);">
+                                <?= $ano_atual ?>
+                            </span>
+                            <button type="button" onclick="navigateDashboardMonth(12)" title="Próximo Ano"
+                                style="border: none; background: transparent; cursor: pointer; color: var(--text-color);"><i
+                                    class="fas fa-chevron-right" style="font-size: 0.8rem;"></i></button>
+                        </div>
+
+                        <?php if ($total_pages_prof > 1): ?>
+                            <div class="prof-pagination"
+                                style="display: inline-flex; align-items: center; gap: 10px; margin-left: 15px;">
+                                <a href="#"
+                                    onclick="document.getElementById('prof_page_hidden').value = <?= max(1, $prof_page - 1) ?>; navigateDashboardMonth(0); return false;"
+                                    title="Anterior"
+                                    style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: var(--bg-color); border: 1px solid var(--border-color); border-radius: 50%; color: var(--text-color); text-decoration: none; <?= $prof_page <= 1 ? 'opacity:0.3; pointer-events:none;' : '' ?>"><i
+                                        class="fas fa-arrow-left" style="font-size: 0.7rem;"></i></a>
+
+                                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 700;">
+                                    <?= $prof_page ?> /
+                                    <?= $total_pages_prof ?>
+                                </span>
+
+                                <a href="#"
+                                    onclick="document.getElementById('prof_page_hidden').value = <?= min($total_pages_prof, $prof_page + 1) ?>; navigateDashboardMonth(0); return false;"
+                                    title="Próximo"
+                                    style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: var(--bg-color); border: 1px solid var(--border-color); border-radius: 50%; color: var(--text-color); text-decoration: none; <?= $prof_page >= $total_pages_prof ? 'opacity:0.3; pointer-events:none;' : '' ?>"><i
+                                        class="fas fa-arrow-right" style="font-size: 0.7rem;"></i></a>
+                            </div>
+                        <?php endif; ?>
+                    </h3>
+                    <div style="display: flex; gap: 15px; font-size: 0.8rem; font-weight: 600;">
+                        <span style="display: flex; align-items: center; gap: 5px; color: #4caf50;"><span
+                                style="width: 10px; height: 10px; background: #4caf50; display: inline-block; border-radius: 2px;"></span>
+                            Livre</span>
+                        <span style="display: flex; align-items: center; gap: 5px; color: #e53935;"><span
+                                style="width: 10px; height: 10px; background: #e53935; display: inline-block; border-radius: 2px;"></span>
+                            Ocupado</span>
+                        <span style="display: flex; align-items: center; gap: 5px; color: #ff8f00;"><span
+                                style="width: 10px; height: 10px; background: #ff8f00; display: inline-block; border-radius: 2px;"></span>
+                            Reservado</span>
+                        <span style="display: flex; align-items: center; gap: 5px; color: #1565c0;"><span
+                                style="width: 10px; height: 10px; background: #1565c0; display: inline-block; border-radius: 2px;"></span>
+                            Feriado / Férias</span>
+                        <span style="display: flex; align-items: center; gap: 5px; color: #555;"><span
+                                style="width: 10px; height: 10px; background: #555; display: inline-block; border-radius: 2px;"></span>
+                            Indisponível</span>
+                    </div>
+                </div>
+                <div class="dash-section-body" style="padding: 0;">
+                    <?php if (empty($prof_resumo)): ?>
+                        <div class="td-empty" style="padding: 40px; text-align: center; color: var(--text-muted);">
+                            <i class="fas fa-search"
+                                style="font-size: 2rem; display: block; margin-bottom: 10px; opacity: .4;"></i>
+                            <?php if (empty($where_clauses)): ?>
+                                Use o filtro acima para pesquisar um professor e ver seu resumo anual.
+                            <?php else: ?>
+                                Nenhum professor encontrado com esses critérios.
+                            <?php endif; ?>
+                        </div>
+                    <?php else: ?>
+                        <div class="prof-anual-list" id="resumo-anual"
+                            style="display: flex; flex-direction: column; gap: 35px;">
+                            <?php foreach ($prof_resumo as $pr): ?>
+                                <div class="prof-anual-item" id="prof-card-<?= $pr['id'] ?>"
+                                    style="background: var(--card-bg); padding: 25px; border-radius: 16px; border: 1px solid var(--border-color); box-shadow: var(--shadow-md); transition: var(--transition-premium); position: relative;">
+                                    <div
+                                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                                        <div style="font-weight: 800; font-size: 1rem; text-transform: uppercase;">
+                                            <a href="javascript:void(0)"
+                                                onclick="openTeacherAgenda(<?= $pr['id'] ?>, '<?= addslashes($pr['nome']) ?>', '<?= $mes_sel ?>')"
+                                                style="color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: 8px;">
+                                                <?= htmlspecialchars($pr['nome']) ?>
+                                                <i class="fas fa-external-link-alt prof-anual-header-icons"
+                                                    style="font-size: 0.7rem; opacity: 0.5;"></i>
+                                            </a>
+                                            <span
+                                                style="color: #888; font-weight: normal; font-size: 0.85rem; text-transform: none;">·
+                                                <?= htmlspecialchars($pr['area']) ?>
+                                            </span>
+                                        </div>
+                                        <div style="display: flex; align-items: center; gap: 15px;">
+                                            <button class="btn-icon-only" onclick="toggleFocusMode('prof-card-<?= $pr['id'] ?>')"
+                                                title="Modo Foco"
+                                                style="background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 5px;">
+                                                <i class="fas fa-expand-alt"></i>
+                                            </button>
+                                            <span style="color: #4caf50; font-weight: 700; font-size: 0.9rem;">
+                                                <?= $pr['dias_livres'] ?> dias livres
+                                            </span>
+                                            <i class="far fa-calendar-alt prof-anual-header-icons" style="color: #888;"></i>
+                                        </div>
+                                    </div>
+
+                                    <div class="mobile-expand-info">
+                                        <i class="fas fa-info-circle" style="color: var(--primary-red); margin-right: 5px;"></i>
+                                        Clique no&nbsp;<i class="fas fa-expand-alt"
+                                            style="color: var(--text-color); margin: 0 6px;"></i>&nbsp;para expandir a visualização
+                                        e ter uma visão mais específica.
+                                    </div>
+
+                                    <div class="free-period-badge-container" style="display: flex; gap: 10px; margin-bottom: 20px;">
+                                        <?php
+                                        foreach ($pr['free_periods'] as $per => $is_free):
+                                            if (!$is_free)
+                                                continue;
+                                            $icon = ($per == 'Manhã') ? 'fa-sun' : (($per == 'Tarde') ? 'fa-cloud-sun' : 'fa-moon');
+                                            ?>
+                                            <div
+                                                style="background: rgba(46, 125, 50, 0.1); color: #4caf50; padding: 6px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; display: flex; align-items: center; gap: 8px; border: 1px solid rgba(46, 125, 50, 0.2);">
+                                                <i class="fas <?= $icon ?>"></i>
+                                                <?= $per ?> Livre
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+
+                                    <div class="timeline-container" style="position: relative;">
+                                        <!-- Botões Navegação Paginada -->
+                                        <button
+                                            onclick="const _gridPrev = this.parentElement.querySelector('.timeline-grid'); _gridPrev.scrollBy({left: -_gridPrev.clientWidth, behavior: 'smooth'})"
+                                            class="timeline-nav-btn prev">
+                                            <i class="fas fa-chevron-left"></i>
+                                        </button>
+
+                                        <div class="timeline-grid"
+                                            style="display: flex; overflow-x: auto; background: var(--bg-color); border-radius: 12px; scroll-behavior: smooth; scroll-snap-type: x mandatory; border: 1px solid var(--border-color);">
+                                            <?php
+                                            // Agrupa o status anual do docente mês a mês
+                                            $months_data = [];
+                                            foreach ($pr['annual_status'] as $date => $data) {
+                                                $m_idx = (int) date('m', strtotime($date));
+                                                $months_data[$m_idx][$date] = $data;
+                                            }
+                                            ksort($months_data);
+
+                                            foreach ($months_data as $m_idx => $days):
+                                                $m_name = $meses_nomes_completos[$m_idx - 1];
+
+                                                // Conta os dias ocupados vs livres neste mês
+                                                $m_busy_count = 0;
+                                                $m_free_count = 0;
+                                                foreach ($days as $dk => $dd) {
+                                                    if ($dd['is_sunday'])
+                                                        continue;
+
+                                                    $has_busy = ($dd['Manhã'] === 'Ocupado' || $dd['Manhã'] === 'Reservado' || $dd['Tarde'] === 'Ocupado' || $dd['Tarde'] === 'Reservado' || $dd['Noite'] === 'Ocupado' || $dd['Noite'] === 'Reservado' || $dd['Integral'] === 'Ocupado' || $dd['Integral'] === 'Reservado');
+                                                    if ((isset($dd['holiday']) && $dd['holiday']) || (isset($dd['vacation']) && $dd['vacation']))
+                                                        continue;
+
+                                                    if ($has_busy)
+                                                        $m_busy_count++;
+                                                    else
+                                                        $m_free_count++;
+                                                }
+                                                ?>
+                                                <div class="month-group" data-month="<?= $m_idx ?>"
+                                                    style="min-width: 100%; scroll-snap-align: start; display: flex; flex-direction: column; gap: 8px; padding: 15px; box-sizing: border-box;">
+                                                    <div class="month-header"
+                                                        style="font-size: 0.9rem; font-weight: 900; text-transform: uppercase; color: var(--corTxt3); border-bottom: 2px solid <?= $m_busy_count > 0 ? '#e53935' : '#4caf50' ?>; padding-bottom: 5px; margin-bottom: 8px; letter-spacing: 1.5px; display: flex; justify-content: space-between; align-items: center;">
+                                                        <span>
+                                                            <?= $m_name ?>
+                                                        </span>
+                                                        <span
+                                                            style="font-size: 0.7rem; font-weight: 600; display: flex; gap: 10px; align-items: center;">
+                                                            <?php if ($m_busy_count > 0): ?>
+                                                                <span style="color: #e53935;"><i class="fas fa-times-circle"></i>
+                                                                    <?= $m_busy_count ?>
+                                                                    ocupado
+                                                                    <?= $m_busy_count > 1 ? 's' : '' ?>
+                                                                </span>
+                                                            <?php endif; ?>
+                                                            <span style="color: #4caf50;"><i class="fas fa-check-circle"></i>
+                                                                <?= $m_free_count ?>
+                                                                livre
+                                                                <?= $m_free_count > 1 ? 's' : '' ?>
+                                                            </span>
+                                                            <span style="color: #888;">Ano
+                                                                <?= $ano_atual ?>
+                                                            </span>
+                                                        </span>
+                                                    </div>
+                                                    <div class="timeline-days-container"
+                                                        style="display: flex; gap: 2px; overflow-x: auto; padding-bottom: 5px; scrollbar-width: thin;">
+                                                        <?php foreach ($days as $date => $data):
+                                                            $d = date('d', strtotime($date));
+                                                            $dow = date('N', strtotime($date));
+                                                            $dias_nomes_curtos = [1 => 'Seg', 2 => 'Ter', 3 => 'Qua', 4 => 'Qui', 5 => 'Sex', 6 => 'Sáb', 7 => 'Dom'];
+                                                            $nome_dia = $dias_nomes_curtos[$dow];
+
+                                                            // Verifica se QUALQUER período no dia está ocupado
+                                                            $any_busy = ($data['Manhã'] === 'Ocupado' || $data['Manhã'] === 'Reservado' || $data['Tarde'] === 'Ocupado' || $data['Tarde'] === 'Reservado' || $data['Noite'] === 'Ocupado' || $data['Noite'] === 'Reservado' || $data['Integral'] === 'Ocupado' || $data['Integral'] === 'Reservado');
+
+                                                            // Define as cores do cabeçalho do dia (Visual semelhante ao da agenda completa)
+                                                            $bg_day = '#2e7d32'; // Verde = Livre
+                                                            $txt_day = '#ffffff';
+                                                            $label_top = $d;
+
+                                                            if (isset($data['holiday']) && $data['holiday']) {
+                                                                $bg_day = '#1565c0'; // Azul para Feriado
+                                                                $label_top = 'F';
+                                                            } elseif (isset($data['vacation']) && $data['vacation']) {
+                                                                $bg_day = '#1565c0'; // Azul para Férias
+                                                                $label_top = 'F';
+                                                            } elseif ($data['is_sunday']) {
+                                                                $bg_day = '#a84a4a'; // Vermelho suave para Domingo
+                                                            } elseif ($any_busy) {
+                                                                $bg_day = '#e53935'; // Vermelho forte para Ocupado
+                                                            } elseif ($data['is_weekend']) {
+                                                                $bg_day = '#2e7d32';
+                                                                $txt_day = '#ffffff';
+                                                            }
+                                                            ?>
+                                                            <?php
+                                                            $is_sat = (date('N', strtotime($date)) == 6);
+                                                            ?>
+                                                            <div class="timeline-day"
+                                                                onclick="window.location.href='php/views/agenda_professores.php?docente_id=<?= $pr['id'] ?>&month=<?= date('Y-m', strtotime($date)) ?>&view_mode=timeline'"
+                                                                style="flex: 1; min-width: 32px; max-width: 42px; display: flex; flex-direction: column; gap: 3px; cursor: pointer; transition: transform 0.2s;"
+                                                                onmouseover="this.style.transform='translateY(-2px)'"
+                                                                onmouseout="this.style.transform='none'"
+                                                                title="<?= (isset($data['holiday']) && $data['holiday']) ? 'FERIADO: ' . $data['holiday'] : ((isset($data['vacation']) && $data['vacation']) ? 'BLOQUEIO: ' . $data['vacation'] : ($any_busy ? 'OCUPADO' : 'LIVRE')) ?>">
+
+                                                                <?php
+                                                                // Degradê/Gradiente para o cabeçalho semelhante ao agenda_professores.php
+                                                                $bg_gradient = 'linear-gradient(135deg, #2e7d32, #1b5e20)';
+                                                                if (isset($data['holiday']) && $data['holiday'] || isset($data['vacation']) && $data['vacation']) {
+                                                                    $bg_gradient = 'linear-gradient(135deg, #1565c0, #1976d2)';
+                                                                } elseif ($data['is_sunday']) {
+                                                                    $bg_gradient = '#a84a4a';
+                                                                } elseif ($any_busy) {
+                                                                    $bg_gradient = 'linear-gradient(135deg, #e53935, #c62828)';
+                                                                } elseif ($data['is_weekend']) {
+                                                                    $bg_gradient = 'linear-gradient(135deg, #2e7d32, #1b5e20)';
+                                                                }
+                                                                ?>
+
+                                                                <div
+                                                                    style="text-align: center; font-size: 0.8rem; font-weight: 800; padding: 7px 0; background: <?= $bg_gradient ?>; border-radius: 6px; color: <?= $txt_day ?>; line-height: 1.1; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                                                                    <div>
+                                                                        <?= str_pad($label_top, 2, '0', STR_PAD_LEFT) ?>
+                                                                    </div>
+                                                                    <div
+                                                                        style="font-size: 0.6rem; opacity: 0.9; text-transform: uppercase;">
+                                                                        <?= substr($nome_dia, 0, 3) ?>
+                                                                    </div>
+                                                                </div>
+                                                                <?php
+                                                                $periods = ['Manhã', 'Tarde', 'Noite'];
+                                                                foreach ($periods as $p):
+                                                                    // Define a cor de cada período na subbarra inferior
+                                                                    if ((isset($data['holiday']) && $data['holiday']) || (isset($data['vacation']) && $data['vacation'])) {
+                                                                        $p_color = '#1565c0'; // Azul = Férias/Feriado
+                                                                    } elseif ($data['is_sunday']) {
+                                                                        $p_color = '#a84a4a'; // Vermelho suave para Domingo
+                                                                    } elseif ($data[$p] === 'Ocupado') {
+                                                                        $p_color = '#e53935'; // Vermelho = Ocupado
+                                                                    } elseif ($data[$p] === 'OFF_SCHEDULE') {
+                                                                        $p_color = '#555'; // Cinza = Fora do Horário
+                                                                    } elseif ($data[$p] === 'Indisponível') {
+                                                                        $p_color = '#555'; // Cinza = Indisponível (Preparação/Atestado)
+                                                                    } elseif ($data[$p] === 'Reservado') {
+                                                                        $p_color = '#ff8f00'; // Laranja = Reservado
+                                                                    } elseif ($is_sat && $p === 'Noite') {
+                                                                        $p_color = '#ccc'; // Cinza Claro = Sábado à Noite (Inativo - Fallback)
+                                                                    } else {
+                                                                        $p_color = '#4caf50'; // Verde = Livre
+                                                                    }
+                                                                    ?>
+                                                                    <?php
+                                                                    $status_label = ($data[$p] === 'OFF_SCHEDULE' || ($is_sat && $p === 'Noite')) ? 'Indisponível' : $data[$p];
+                                                                    ?>
+                                                                    <div style="height: 6px; width: 100%; background: <?= $p_color ?>; border-radius: 1px;"
+                                                                        title="<?= $date ?> - <?= $p ?>: <?= $status_label ?>">
+                                                                    </div>
+                                                                <?php endforeach; ?>
+                                                            </div>
+                                                        <?php endforeach; ?>
+                                                    </div>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+
+                                        <!-- Added wrapper for arrows to not overlay scrollbar -->
+                                        <button
+                                            onclick="const _gridNext = this.parentElement.querySelector('.timeline-grid'); _gridNext.scrollBy({left: _gridNext.clientWidth, behavior: 'smooth'})"
+                                            class="timeline-nav-btn next">
+                                            <i class="fas fa-chevron-right"></i>
+                                        </button>
+                                    </div>
+                                    <div class="timeline-legend-container"
+                                        style="display: flex; gap: 15px; font-size: 0.75rem; color: var(--text-muted); margin-top: 15px; font-weight: 700; flex-wrap: wrap; align-items: center; background: var(--bg-color); padding: 10px 20px; border-radius: 10px;">
+                                        <span style="color: var(--text-color); margin-right: 5px;"><i
+                                                class="fas fa-info-circle"></i>
+                                            Legenda de Períodos:</span>
+                                        <span style="display: flex; align-items: center; gap: 6px;"><span
+                                                style="width: 12px; height: 4px; background: #4caf50; border-radius: 1px; display: inline-block;"></span>
+                                            Manhã</span>
+                                        <span style="display: flex; align-items: center; gap: 6px;"><span
+                                                style="width: 12px; height: 4px; background: #4caf50; border-radius: 1px; display: inline-block;"></span>
+                                            Tarde</span>
+                                        <span style="display: flex; align-items: center; gap: 6px;"><span
+                                                style="width: 12px; height: 4px; background: #4caf50; border-radius: 1px; display: inline-block;"></span>
+                                            Noite</span>
+                                        <span style="display: flex; align-items: center; gap: 6px;"><span
+                                                style="width: 12px; height: 4px; background: #555; border-radius: 1px; display: inline-block;"></span>
+                                            Indisponível</span>
+                                        <span style="margin-left: auto; font-size: 0.7rem; opacity: 0.8; font-style: italic;">
+                                            * Períodos exibidos de cima para baixo
+                                        </span>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php endif; ?>
+
+        <div class="sidebar-column" <?= isSecretaria() ? 'style="display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 30px; padding: 20px;"' : '' ?>>
+            <div class="dash-section" style="border-left: 4px solid #1976d2; background: rgba(25, 118, 210, 0.03);">
+                <div class="dash-section-header">
+                    <h3 style="color: #1976d2;"><i class="fas fa-history"></i> Turmas Encerradas (7 dias)</h3>
+                </div>
+                <div class="dash-section-body" style="padding: 0;">
+                    <?php if (empty($encerradas)): ?>
+                        <div style="padding: 20px; text-align: center; color: var(--text-muted); font-size: 0.8rem;">Nenhuma
+                            turma encerrada recentemente.</div>
+                    <?php else: ?>
+                        <?php foreach ($encerradas as $te): ?>
+                            <div class="proximas-item" <?= !isCRI() ? "onclick=\"location.href='php/views/turmas.php?id={$te['id']}'\"" : '' ?>
+                                style="padding: 15px 20px; border-bottom: 1px solid var(--border-color);
+                        <?= !isCRI() ? 'cursor: pointer;' : 'cursor: default;' ?> transition: all 0.2s; display: flex; flex-direction: column; gap: 6px;">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 5px;">
+                                    <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
+                                        <span
+                                            style="font-weight: 800; font-size: 0.9rem; color: #1976d2; letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                            <i class="fas fa-tag" style="font-size: 0.75rem; opacity: 0.7;"></i>
+                                            <?= !empty($te['sigla']) ? htmlspecialchars($te['sigla']) : '<span style="font-style:italic; font-weight:400; opacity:0.6;">Sem Sigla</span>' ?>
+                                        </span>
+                                        <div style="font-size: 0.6rem; background: rgba(25, 118, 210, 0.1); color: #1976d2; padding: 2px 8px; border-radius: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: fit-content; max-width: 200px;"
+                                            title="<?= implode(', ', array_filter([$te['prof1'] ?? '', $te['prof2'] ?? '', $te['prof3'] ?? '', $te['prof4'] ?? ''])) ?>">
+                                            <i class="fas fa-user-tie" style="font-size: 0.55rem;"></i>
+                                            <?= implode(', ', array_filter([$te['prof1'] ?? '', $te['prof2'] ?? '', $te['prof3'] ?? '', $te['prof4'] ?? ''])) ?: 'N/D' ?>
+                                        </div>
+                                    </div>
+                                    <span class="status-badge status-encerrada"
+                                        style="font-size: 0.6rem; padding: 2px 8px; white-space: nowrap;">
+                                        <i class="fas fa-check-circle"></i> Encerrada
+                                    </span>
+                                </div>
+                                <div style="font-size: 0.85rem; font-weight: 600; color: var(--text-color); line-height: 1.2;">
+                                    <?= htmlspecialchars($te['curso_nome']) ?>
+                                </div>
+                                <?php
+                                $dias_arr = !empty($te['dias_semana']) ? explode(',', $te['dias_semana']) : [];
+                                $map_curtos = ['Segunda-feira' => 'Seg', 'Terça-feira' => 'Ter', 'Quarta-feira' => 'Qua', 'Quinta-feira' => 'Qui', 'Sexta-feira' => 'Sex', 'Sábado' => 'Sáb', 'Domingo' => 'Dom'];
+                                $dias_curtos = array_map(function ($d) use ($map_curtos) {
+                                    return $map_curtos[trim($d)] ?? trim($d);
+                                }, $dias_arr);
+                                $dias_str = implode(', ', $dias_curtos);
+                                $h_ini = !empty($te['horario_inicio']) ? substr($te['horario_inicio'], 0, 5) : '--:--';
+                                $h_fim = !empty($te['horario_fim']) ? substr($te['horario_fim'], 0, 5) : '--:--';
+                                ?>
+                                <div
+                                    style="font-size: 0.75rem; color: #555; font-weight: 700; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <?php if (!empty($dias_str)): ?>
+                                        <span><i class="fas fa-calendar-day" style="color: #1976d2; opacity: 0.8;"></i>
+                                            <?= htmlspecialchars($dias_str) ?></span>
+                                    <?php endif; ?>
+                                    <span><i class="fas fa-clock" style="color: #1976d2; opacity: 0.8;"></i>
+                                        <?= "$h_ini às $h_fim" ?></span>
+                                </div>
+                                <div
+                                    style="display: flex; justify-content: flex-start; align-items: center; margin-top: 4px; gap: 15px; width: 100%;">
+                                    <span
+                                        style="font-size: 0.75rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px;">
+                                        <i class="fas fa-map-marker-alt" style="color: #1976d2; opacity: 0.8;"></i>
+                                        <?= !empty($te['cidade']) ? htmlspecialchars($te['cidade']) : 'Sede' ?>
+                                    </span>
+                                    <span
+                                        style="font-size: 0.8rem; color: #1976d2; font-weight: 800; background: rgba(25, 118, 210, 0.08); padding: 3px 10px; border-radius: 6px;">
+                                        <i class="far fa-calendar-check"></i>
+                                        <?= date('d/m', strtotime($te['data_fim'])) ?>
+                                    </span>
+                                    <span <?= $can_open_checklist ? 'onclick="event.stopPropagation(); window.location.href=\'php/views/turmas.php?id=' . $te['id'] . '&open_checklist=1\';"' : '' ?>
+                                        style="font-size: 0.72rem; color: <?= !empty($te['coordenacao_diario_entregue_secretaria']) ? '#2e7d32' : '#c62828' ?>; font-weight: 700; background: <?= !empty($te['coordenacao_diario_entregue_secretaria']) ? 'rgba(46, 125, 50, 0.08)' : 'rgba(198, 40, 40, 0.08)' ?>; padding: 3px 8px; border-radius: 6px; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; <?= $can_open_checklist ? 'cursor: pointer;' : '' ?>">
+                                        <i
+                                            class="fas <?= !empty($te['coordenacao_diario_entregue_secretaria']) ? 'fa-check-circle' : 'fa-times-circle' ?>"></i>
+                                        <?= !empty($te['coordenacao_diario_entregue_secretaria']) ? 'Diário Entregue' : 'Diário Pendente' ?>
+                                    </span>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="dash-section"
+                style="border-left: 4px solid var(--primary-red); background: rgba(229, 57, 53, 0.03);">
+                <div class="dash-section-header">
+                    <h3 style="color: var(--primary-red);"><i class="fas fa-exclamation-circle"></i> Turmas
+                        Encerrando (7 dias)</h3>
+                </div>
+                <div class="dash-section-body" style="padding: 0;">
+                    <?php if (empty($encerrando)): ?>
+                        <div style="padding: 20px; text-align: center; color: var(--text-muted); font-size: 0.8rem;">Nenhuma
+                            turma encerrando esta semana.</div>
+                    <?php else: ?>
+                        <?php foreach ($encerrando as $te): ?>
+                            <div class="proximas-item" <?= !isCRI() ? "onclick=\"location.href='php/views/turmas.php?id={$te['id']}'\"" : '' ?>
+                                style="padding: 15px 20px; border-bottom: 1px solid var(--border-color);
+                        <?= !isCRI() ? 'cursor: pointer;' : 'cursor: default;' ?> transition: all 0.2s; display: flex; flex-direction: column; gap: 6px;">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 5px;">
+                                    <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
+                                        <span
+                                            style="font-weight: 800; font-size: 0.9rem; color: var(--primary-red); letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                            <i class="fas fa-tag" style="font-size: 0.75rem; opacity: 0.7;"></i>
+                                            <?= !empty($te['sigla']) ? htmlspecialchars($te['sigla']) : '<span style="font-style:italic; font-weight:400; opacity:0.6;">Sem Sigla</span>' ?>
+                                        </span>
+                                        <div style="font-size: 0.6rem; background: rgba(229, 57, 53, 0.1); color: var(--primary-red); padding: 2px 8px; border-radius: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: fit-content; max-width: 200px;"
+                                            title="<?= implode(', ', array_filter([$te['prof1'] ?? '', $te['prof2'] ?? '', $te['prof3'] ?? '', $te['prof4'] ?? ''])) ?>">
+                                            <i class="fas fa-user-tie" style="font-size: 0.55rem;"></i>
+                                            <?= implode(', ', array_filter([$te['prof1'] ?? '', $te['prof2'] ?? '', $te['prof3'] ?? '', $te['prof4'] ?? ''])) ?: 'N/D' ?>
+                                        </div>
+                                    </div>
+                                    <span class="status-badge status-critico"
+                                        style="font-size: 0.6rem; padding: 2px 8px; white-space: nowrap;">
+                                        <i class="fas fa-exclamation-triangle"></i> Encerrando
+                                    </span>
+                                </div>
+                                <div style="font-size: 0.85rem; font-weight: 600; color: var(--text-color); line-height: 1.2;">
+                                    <?= htmlspecialchars($te['curso_nome']) ?>
+                                </div>
+                                <?php
+                                $dias_arr = !empty($te['dias_semana']) ? explode(',', $te['dias_semana']) : [];
+                                $map_curtos = ['Segunda-feira' => 'Seg', 'Terça-feira' => 'Ter', 'Quarta-feira' => 'Qua', 'Quinta-feira' => 'Qui', 'Sexta-feira' => 'Sex', 'Sábado' => 'Sáb', 'Domingo' => 'Dom'];
+                                $dias_curtos = array_map(function ($d) use ($map_curtos) {
+                                    return $map_curtos[trim($d)] ?? trim($d);
+                                }, $dias_arr);
+                                $dias_str = implode(', ', $dias_curtos);
+                                $h_ini = !empty($te['horario_inicio']) ? substr($te['horario_inicio'], 0, 5) : '--:--';
+                                $h_fim = !empty($te['horario_fim']) ? substr($te['horario_fim'], 0, 5) : '--:--';
+                                ?>
+                                <div
+                                    style="font-size: 0.75rem; color: #555; font-weight: 700; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <?php if (!empty($dias_str)): ?>
+                                        <span><i class="fas fa-calendar-day" style="color: var(--primary-red); opacity: 0.8;"></i>
+                                            <?= htmlspecialchars($dias_str) ?></span>
+                                    <?php endif; ?>
+                                    <span><i class="fas fa-clock" style="color: var(--primary-red); opacity: 0.8;"></i>
+                                        <?= "$h_ini às $h_fim" ?></span>
+                                </div>
+                                <div
+                                    style="display: flex; justify-content: flex-start; align-items: center; margin-top: 4px; gap: 15px; width: 100%;">
+                                    <span
+                                        style="font-size: 0.75rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px;">
+                                        <i class="fas fa-map-marker-alt" style="color: var(--primary-red); opacity: 0.8;"></i>
+                                        <?= !empty($te['cidade']) ? htmlspecialchars($te['cidade']) : 'Sede' ?>
+                                    </span>
+                                    <span
+                                        style="font-size: 0.8rem; color: var(--primary-red); font-weight: 800; background: rgba(229, 57, 53, 0.08); padding: 3px 10px; border-radius: 6px;">
+                                        <i class="far fa-calendar-times"></i>
+                                        <?= date('d/m', strtotime($te['data_fim'])) ?>
+                                    </span>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="dash-section" style="border-left: 4px solid #388e3c; background: rgba(56, 142, 60, 0.03);">
+                <div class="dash-section-header">
+                    <h3 style="color: #388e3c;"><i class="fas fa-play-circle"></i> Turmas
+                        Iniciadas (5 dias)</h3>
+                </div>
+                <div class="dash-section-body" style="padding: 0;">
+                    <?php if (empty($iniciadas)): ?>
+                        <div style="padding: 20px; text-align: center; color: var(--text-muted); font-size: 0.8rem;">Nenhuma
+                            turma iniciada nos últimos 5 dias.</div>
+                    <?php else: ?>
+                        <?php foreach ($iniciadas as $ti): ?>
+                            <div class="proximas-item" <?= !isCRI() ? "onclick=\"location.href='php/views/turmas.php?id={$ti['id']}'\"" : '' ?>
+                                style="padding: 15px 20px; border-bottom: 1px solid var(--border-color);
+                        <?= !isCRI() ? 'cursor: pointer;' : 'cursor: default;' ?> transition: all 0.2s; display: flex; flex-direction: column; gap: 6px;">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 5px;">
+                                    <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
+                                        <span
+                                            style="font-weight: 800; font-size: 0.9rem; color: #388e3c; letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                            <i class="fas fa-tag" style="font-size: 0.75rem; opacity: 0.7;"></i>
+                                            <?= !empty($ti['sigla']) ? htmlspecialchars($ti['sigla']) : '<span style="font-style:italic; font-weight:400; opacity:0.6;">Sem Sigla</span>' ?>
+                                        </span>
+                                        <div style="font-size: 0.6rem; background: rgba(56, 142, 60, 0.1); color: #388e3c; padding: 2px 8px; border-radius: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: fit-content; max-width: 200px;"
+                                            title="<?= implode(', ', array_filter([$ti['prof1'] ?? '', $ti['prof2'] ?? '', $ti['prof3'] ?? '', $ti['prof4'] ?? ''])) ?>">
+                                            <i class="fas fa-user-tie" style="font-size: 0.55rem;"></i>
+                                            <?= implode(', ', array_filter([$ti['prof1'] ?? '', $ti['prof2'] ?? '', $ti['prof3'] ?? '', $ti['prof4'] ?? ''])) ?: 'N/D' ?>
+                                        </div>
+                                    </div>
+                                    <span class="status-badge status-andamento"
+                                        style="font-size: 0.6rem; padding: 2px 8px; white-space: nowrap;">
+                                        <i class="fas fa-play"></i> Iniciada
+                                    </span>
+                                </div>
+                                <div style="font-size: 0.85rem; font-weight: 600; color: var(--text-color); line-height: 1.2;">
+                                    <?= htmlspecialchars($ti['curso_nome']) ?>
+                                </div>
+                                <?php
+                                $dias_arr = !empty($ti['dias_semana']) ? explode(',', $ti['dias_semana']) : [];
+                                $map_curtos = ['Segunda-feira' => 'Seg', 'Terça-feira' => 'Ter', 'Quarta-feira' => 'Qua', 'Quinta-feira' => 'Qui', 'Sexta-feira' => 'Sex', 'Sábado' => 'Sáb', 'Domingo' => 'Dom'];
+                                $dias_curtos = array_map(function ($d) use ($map_curtos) {
+                                    return $map_curtos[trim($d)] ?? trim($d);
+                                }, $dias_arr);
+                                $dias_str = implode(', ', $dias_curtos);
+                                $h_ini = !empty($ti['horario_inicio']) ? substr($ti['horario_inicio'], 0, 5) : '--:--';
+                                $h_fim = !empty($ti['horario_fim']) ? substr($ti['horario_fim'], 0, 5) : '--:--';
+                                ?>
+                                <div
+                                    style="font-size: 0.75rem; color: #555; font-weight: 700; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <?php if (!empty($dias_str)): ?>
+                                        <span><i class="fas fa-calendar-day" style="color: #388e3c; opacity: 0.8;"></i>
+                                            <?= htmlspecialchars($dias_str) ?></span>
+                                    <?php endif; ?>
+                                    <span><i class="fas fa-clock" style="color: #388e3c; opacity: 0.8;"></i>
+                                        <?= "$h_ini às $h_fim" ?></span>
+                                </div>
+                                <div
+                                    style="display: flex; justify-content: flex-start; align-items: center; margin-top: 4px; gap: 15px; width: 100%;">
+                                    <span
+                                        style="font-size: 0.75rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px;">
+                                        <i class="fas fa-map-marker-alt" style="color: #388e3c; opacity: 0.8;"></i>
+                                        <?= !empty($ti['cidade']) ? htmlspecialchars($ti['cidade']) : 'Sede' ?>
+                                    </span>
+                                    <span
+                                        style="font-size: 0.8rem; color: #388e3c; font-weight: 800; background: rgba(56, 142, 60, 0.08); padding: 3px 10px; border-radius: 6px;">
+                                        <i class="far fa-calendar-plus"></i>
+                                        <?= date('d/m', strtotime($ti['data_inicio'])) ?>
+                                    </span>
+                                    <span <?= $can_open_checklist ? 'onclick="event.stopPropagation(); window.location.href=\'php/views/turmas.php?id=' . $ti['id'] . '&open_checklist=1\';"' : '' ?>
+                                        style="font-size: 0.72rem; color: <?= !empty($ti['coordenacao_fichas_entregues_secretaria']) ? '#2e7d32' : '#c62828' ?>; font-weight: 700; background: <?= !empty($ti['coordenacao_fichas_entregues_secretaria']) ? 'rgba(46, 125, 50, 0.08)' : 'rgba(198, 40, 40, 0.08)' ?>; padding: 3px 8px; border-radius: 6px; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; <?= $can_open_checklist ? 'cursor: pointer;' : '' ?>">
+                                        <i
+                                            class="fas <?= !empty($ti['coordenacao_fichas_entregues_secretaria']) ? 'fa-check-circle' : 'fa-times-circle' ?>"></i>
+                                        <?= !empty($ti['coordenacao_fichas_entregues_secretaria']) ? 'Ficha Entregue' : 'Ficha Pendente' ?>
+                                    </span>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="dash-section">
+                <div class="dash-section-header"
+                    style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3 style="margin: 0;"><i class="fas fa-rocket" style="color: #ff8f00;"></i> Próximas Turmas
+                        (30 dias)
+                    </h3>
+                    <?php if ($total_proximas_pages > 1): ?>
+                        <div
+                            style="display: flex; align-items: center; gap: 10px; background: rgba(0,0,0,0.05); padding: 4px 10px; border-radius: 20px;">
+                            <button type="button" onclick="navigateProximasTurmas(-1)" title="Anterior"
+                                style="border:none; background:transparent; cursor:pointer; color:var(--text-color); <?= $proximas_page <= 1 ? 'opacity:0.3; pointer-events:none;' : '' ?>"><i
+                                    class="fas fa-chevron-left" style="font-size:0.7rem;"></i></button>
+                            <span
+                                style="font-size: 0.75rem; font-weight: 800; color: #ff8f00; min-width: 60px; text-align: center;">
+                                <?= $proximas_page ?>
+                                /
+                                <?= $total_proximas_pages ?>
+                            </span>
+                            <button type="button" onclick="navigateProximasTurmas(1)" title="Próximo"
+                                style="border:none; background:transparent; cursor:pointer; color:var(--text-color); <?= $proximas_page >= $total_proximas_pages ? 'opacity:0.3; pointer-events:none;' : '' ?>"><i
+                                    class="fas fa-chevron-right" style="font-size:0.7rem;"></i></button>
+                        </div>
+                    <?php endif; ?>
+                </div>
+                <div class="dash-section-body" style="padding: 0;">
+                    <?php if (empty($proximas)): ?>
+                        <div style="padding: 30px; text-align: center; color: var(--text-muted); font-size: 0.85rem;">
+                            <i class="fas fa-calendar-day"
+                                style="font-size: 2rem; opacity: 0.2; display: block; margin-bottom: 10px;"></i>
+                            Nenhuma turma futura programada.
+                        </div>
+                    <?php else: ?>
+                        <div class="proximas-list">
+                            <?php foreach ($proximas as $pt): ?>
+                                <div class="proximas-item" <?= !isCRI() ? "onclick=\"location.href='php/views/turmas.php?id={$pt['id']}'\"" : '' ?> style="padding: 15px 20px; border-bottom: 1px solid var(--border-color);
+                            <?= !isCRI() ? 'cursor: pointer;' : 'cursor: default;' ?> transition: all 0.2s; display:
+                            flex; flex-direction: column; gap: 6px;">
+                                    <div
+                                        style="display: flex; justify-content: space-between; align-items: flex-start; gap: 5px;">
+                                        <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
+                                            <span
+                                                style="font-weight: 800; font-size: 0.9rem; color: #ff8f00; letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                                <i class="fas fa-tag" style="font-size: 0.75rem; opacity: 0.7;"></i>
+                                                <?= !empty($pt['sigla']) ? htmlspecialchars($pt['sigla']) : '<span style="font-style:italic; font-weight:400; opacity:0.6;">Sem Sigla</span>' ?>
+                                            </span>
+                                            <div style="font-size: 0.6rem; background: rgba(255, 143, 0, 0.1); color: #ff8f00; padding: 2px 8px; border-radius: 10px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: fit-content; max-width: 200px;"
+                                                title="<?= implode(', ', array_filter([$pt['prof1'] ?? '', $pt['prof2'] ?? '', $pt['prof3'] ?? '', $pt['prof4'] ?? ''])) ?>">
+                                                <i class="fas fa-user-tie" style="font-size: 0.55rem;"></i>
+                                                <?= implode(', ', array_filter([$pt['prof1'] ?? '', $pt['prof2'] ?? '', $pt['prof3'] ?? '', $pt['prof4'] ?? ''])) ?: 'N/D' ?>
+                                            </div>
+                                        </div>
+                                        <span class="status-badge status-futura"
+                                            style="font-size: 0.6rem; padding: 2px 8px; white-space: nowrap;">
+                                            <i class="fas fa-clock"></i> Futura
+                                        </span>
+                                    </div>
+                                    <div
+                                        style="font-size: 0.85rem; font-weight: 600; color: var(--text-color); line-height: 1.2;">
+                                        <?= htmlspecialchars($pt['curso_nome']) ?>
+                                    </div>
+                                    <?php
+                                    $dias_arr = !empty($pt['dias_semana']) ? explode(',', $pt['dias_semana']) : [];
+                                    $map_curtos = [
+                                        'Segunda-feira' => 'Seg',
+                                        'Terça-feira' => 'Ter',
+                                        'Quarta-feira' => 'Qua',
+                                        'Quinta-feira' => 'Qui',
+                                        'Sexta-feira' => 'Sex',
+                                        'Sábado' => 'Sáb',
+                                        'Domingo' => 'Dom'
+                                    ];
+                                    $dias_curtos = array_map(function ($d) use ($map_curtos) {
+                                        return $map_curtos[trim($d)] ?? trim($d);
+                                    }, $dias_arr);
+                                    $dias_str = implode(', ', $dias_curtos);
+                                    $h_ini = !empty($pt['horario_inicio']) ? substr($pt['horario_inicio'], 0, 5) : '--:--';
+                                    $h_fim = !empty($pt['horario_fim']) ? substr($pt['horario_fim'], 0, 5) : '--:--';
+                                    ?>
+                                    <div
+                                        style="font-size: 0.75rem; color: #555; font-weight: 700; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap;">
+                                        <?php if (!empty($dias_str)): ?>
+                                            <span><i class="fas fa-calendar-day" style="color: #ff8f00; opacity: 0.8;"></i>
+                                                <?= htmlspecialchars($dias_str) ?></span>
+                                        <?php endif; ?>
+                                        <span><i class="fas fa-clock" style="color: #ff8f00; opacity: 0.8;"></i>
+                                            <?= "$h_ini às $h_fim" ?></span>
+                                    </div>
+                                    <div
+                                        style="display: flex; justify-content: flex-start; align-items: center; margin-top: 4px; gap: 15px; width: 100%;">
+                                        <span
+                                            style="font-size: 0.75rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px;">
+                                            <i class="fas fa-map-marker-alt" style="color: #ff8f00; opacity: 0.8;"></i>
+                                            <?= !empty($pt['cidade']) ? htmlspecialchars($pt['cidade']) : 'Sede' ?>
+                                        </span>
+                                        <span
+                                            style="font-size: 0.8rem; color: #ff8f00; font-weight: 800; background: rgba(255, 143, 0, 0.08); padding: 3px 10px; border-radius: 6px;">
+                                            <i class="far fa-calendar-alt"></i>
+                                            <?= date('d/m', strtotime($pt['data_inicio_real'])) ?>
+                                        </span>
+                                        <span <?= $can_open_checklist ? 'onclick="event.stopPropagation(); window.location.href=\'php/views/turmas.php?id=' . $pt['id'] . '&open_checklist=1\';"' : '' ?>
+                                            style="font-size: 0.72rem; color: <?= !empty($pt['opp_reprografia_solicitada']) ? '#2e7d32' : '#c62828' ?>; font-weight: 700; background: <?= !empty($pt['opp_reprografia_solicitada']) ? 'rgba(46, 125, 50, 0.08)' : 'rgba(198, 40, 40, 0.08)' ?>; padding: 3px 8px; border-radius: 6px; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; <?= $can_open_checklist ? 'cursor: pointer;' : '' ?>">
+                                            <i
+                                                class="fas <?= !empty($pt['opp_reprografia_solicitada']) ? 'fa-check-circle' : 'fa-times-circle' ?>"></i>
+                                            <?= !empty($pt['opp_reprografia_solicitada']) ? 'Material Solicitado' : 'Material Pendente' ?>
+                                        </span>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+
+</div> <!-- End dashboard-ajax-content -->
+
+<?php if (!isSecretaria()): ?>
+    <!-- Modais de Produção Aluno/Hora -->
+    <link rel="stylesheet" href="css/producao_dashboard.css?v=<?= time() ?>">
+    <script src="js/producao_aluno_hora.js?v=<?= time() ?>"></script>
+    <script src="js/workload_dashboard.js?v=<?= time() ?>"></script>
+    <script src="js/financeiro_dashboard.js?v=<?= time() ?>"></script>
+    <script src="js/metas_ah.js?v=<?= time() ?>"></script>
+    <script src="js/substituicao.js?v=<?= time() ?>"></script>
+
+    <!-- Modal: Carga Horária Global -->
+    <div id="modal-workload-global" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header">
+                <h3><i class="fas fa-business-time"></i> Carga Horária Disponível por Docente</h3>
+                <button class="modal-producao-close" onclick="closeWorkloadModal()">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <p
+                    style="text-align: center; color: var(--text-muted); font-size: 0.95rem; margin-top: -10px; margin-bottom: 25px; font-weight: 500;">
+                    <i class="fas fa-info-circle"></i> Disponibilidade estimada até o dia 31/12 em ordem decrescente.
+                </p>
+                <div class="producao-chart-section">
+                    <div class="chart-container-wrapper" style="height: 450px;">
+                        <canvas id="chartWorkloadDocentes"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 1: Visão Geral e Gráfico -->
+    <div id="modal-producao-geral" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header">
+                <h3><i class="fas fa-chart-bar"></i> Produção Aluno/Hora por Docente</h3>
+                <button class="modal-producao-close" onclick="closeProducaoModal('modal-producao-geral')">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <p
+                    style="text-align: center; color: var(--text-muted); font-size: 0.95rem; margin-top: -10px; margin-bottom: 25px; font-weight: 500;">
+                    <i class="fas fa-info-circle"></i> Clique em uma barra para abrir o detalhamento por turma.
+                </p>
+                <div class="chart-controls" style="display: flex; flex-direction: column; align-items: center; gap: 15px; margin-bottom: 20px;">
+                    <div class="search-wrapper">
+                        <i class="fas fa-search"></i>
+                        <input type="text" id="search-producao-prof" placeholder="Pesquisar professor no ranking..."
+                            oninput="filterProducaoChart()">
+                    </div>
+                    <div class="filter-pills" id="producao-categoria-filters">
+                        <button class="filter-pill active" onclick="setProducaoCategoriaFilter(null)">Todos</button>
+                        <button class="filter-pill" onclick="setProducaoCategoriaFilter('CAI')">CAI</button>
+                        <button class="filter-pill" onclick="setProducaoCategoriaFilter('CT')">CT</button>
+                        <button class="filter-pill" onclick="setProducaoCategoriaFilter('FIC')">FIC</button>
+                    </div>
+                </div>
+                <div class="producao-kpi-container">
+                    <div class="producao-kpi-card" style="margin-bottom: 20px;">
+                        <span class="kpi-label">Produção Total Acumulada</span>
+                        <span class="kpi-value" id="total-producao-geral">0 A/H</span>
+                    </div>
+                </div>
+                <div class="producao-chart-section">
+                    <div class="chart-container-wrapper" style="height: 400px;">
+                        <canvas id="chartProducaoDocentes"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 2: Detalhes do Professor -->
+    <div id="modal-producao-detalhe" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header">
+                <h3><i class="fas fa-user-tie"></i> Detalhes de Produção: <span id="detalhe-prof-nome">...</span></h3>
+                <button class="modal-producao-close" onclick="closeProducaoModal('modal-producao-detalhe')">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <div
+                    style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 0 25px;">
+                    <span
+                        style="font-size: 0.85rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Turma
+                        / Curso</span>
+                    <span
+                        style="font-size: 0.85rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Ação</span>
+                </div>
+                <div id="lista-turmas-producao" class="turmas-producao-list">
+                    <!-- Preenchido via JS -->
+                </div>
+            </div>
+            <div class="modal-producao-footer" style="justify-content: center;">
+                <button class="btn btn-secondary" onclick="backToProducaoGeral()"><i class="fas fa-arrow-left"></i>
+                    Voltar ao Ranking</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 3: Pequeno Input de Evasão -->
+    <div id="modal-producao-evasao" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in" style="max-width: 400px;">
+            <div class="modal-producao-header">
+                <h3><i class="fas fa-user-minus"></i> Registrar Evasão</h3>
+                <button class="modal-producao-close" onclick="closeProducaoModal('modal-producao-evasao')">&times;</button>
+            </div>
+            <div class="modal-producao-body" style="text-align: center;">
+                <p style="font-size: 1rem; color: var(--text-color); margin-bottom: 25px; font-weight: 500;">
+                    Informe a quantidade de alunos que saíram desta turma:
+                </p>
+                <div class="form-group">
+                    <input type="number" id="input-qtd-evasao" class="form-input" value="1" min="1"
+                        style="font-size: 1.2rem; text-align: center; font-weight: 700;">
+                </div>
+                <input type="hidden" id="hidden-evasao-turma-id">
+                <input type="hidden" id="hidden-evasao-docente-id">
+            </div>
+            <div class="modal-producao-footer" style="justify-content: center; gap: 15px;">
+                <button class="btn btn-secondary" onclick="closeProducaoModal('modal-producao-evasao')">Cancelar</button>
+                <button class="btn btn-primary" onclick="confirmarEvasao()" style="background: #d32f2f;">Confirmar
+                    Evasão</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 4: Pequeno Input de Adição de Alunos -->
+    <div id="modal-producao-adicao" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in" style="max-width: 400px;">
+            <div class="modal-producao-header">
+                <h3><i class="fas fa-user-plus"></i> Adicionar Aluno(s)</h3>
+                <button class="modal-producao-close" onclick="closeProducaoModal('modal-producao-adicao')">&times;</button>
+            </div>
+            <div class="modal-producao-body" style="text-align: center;">
+                <p style="font-size: 1rem; color: var(--text-color); margin-bottom: 25px; font-weight: 500;">
+                    Informe a quantidade de alunos a adicionar nesta turma:
+                </p>
+                <div class="form-group">
+                    <input type="number" id="input-qtd-adicao" class="form-input" value="1" min="1"
+                        style="font-size: 1.2rem; text-align: center; font-weight: 700;">
+                </div>
+                <input type="hidden" id="hidden-adicao-turma-id">
+                <input type="hidden" id="hidden-adicao-docente-id">
+            </div>
+            <div class="modal-producao-footer" style="justify-content: center; gap: 15px;">
+                <button class="btn btn-secondary" onclick="closeProducaoModal('modal-producao-adicao')">Cancelar</button>
+                <button class="btn btn-primary" onclick="confirmarAdicao()" style="background: #2e7d32;">Confirmar
+                    Adição</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 5: Ressarcimento por Curso (Ranking) -->
+    <div id="modal-ressarcimento-ranking" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header" style="background: #388e3c; color: white;">
+                <h3><i class="fas fa-hand-holding-usd"></i> Ressarcimento por Curso</h3>
+                <button class="modal-producao-close" onclick="closeFinanceiroModal('modal-ressarcimento-ranking')"
+                    style="color: white;">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <div style="display: flex; justify-content: center; margin-bottom: 20px;">
+                    <div class="filter-pills" id="ressarcimento-atendimento-filters">
+                        <button class="filter-pill active" onclick="setRessarcimentoFilter(null)">Todos</button>
+                        <button class="filter-pill" onclick="setRessarcimentoFilter('Empresa')">Empresa</button>
+                        <button class="filter-pill" onclick="setRessarcimentoFilter('Entidade')">Entidade</button>
+                        <button class="filter-pill" onclick="setRessarcimentoFilter('Balcão')">Balcão</button>
+                    </div>
+                </div>
+                <div class="producao-kpi-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <div class="producao-kpi-card" onclick="openRessarcimentoListaModal()"
+                        style="cursor: pointer; border-left-color: #388e3c; background: linear-gradient(135deg, #388e3c, #2e7d32);">
+                        <span class="kpi-label">Arrecadação Real (Confirmada)</span>
+                        <span class="kpi-value" id="total-ressarcido-geral">R$ 0,00</span>
+                        <span class="kpi-subtext"><i class="fas fa-search-plus"></i> Ver detalhamento real</span>
+                    </div>
+                    <div class="producao-kpi-card"
+                        style="border-left-color: #fb8c00; background: linear-gradient(135deg, #fb8c00, #ef6c00);">
+                        <span class="kpi-label">Pipeline (Reservas)</span>
+                        <span class="kpi-value" id="total-ressarcido-pipeline">R$ 0,00</span>
+                        <span class="kpi-subtext"><i class="fas fa-info-circle"></i> Turmas em negociação</span>
+                    </div>
+                </div>
+                <div class="producao-chart-section">
+                    <div class="chart-container-wrapper" style="height: 400px;">
+                        <canvas id="chartRessarcimentoCursos"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 5.1: Detalhamento de Ressarcimento (Lista) -->
+    <div id="modal-ressarcimento-lista" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header" style="background: #2e7d32; color: white;">
+                <h3><i class="fas fa-list-ul"></i> Detalhamento de Ressarcimento</h3>
+                <button class="modal-producao-close" onclick="closeFinanceiroModal('modal-ressarcimento-lista')"
+                    style="color: white;">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <div id="lista-ressarcimento-turmas" class="turmas-producao-list"
+                    style="max-height: 500px; overflow-y: auto;">
+                    <!-- Preenchido via JS -->
+                </div>
+            </div>
+            <div class="modal-producao-footer" style="justify-content: center;">
+                <button class="btn btn-secondary" onclick="backToRessarcimentoRanking()"><i class="fas fa-arrow-left"></i>
+                    Voltar ao Gráfico</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 6: Previsão de Despesas (Gráfico Geral) -->
+    <div id="modal-despesas-geral" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header" style="background: #e65100; color: white;">
+                <h3><i class="fas fa-money-bill-wave"></i> Previsão de Despesas por Turma</h3>
+                <button class="modal-producao-close" onclick="closeFinanceiroModal('modal-despesas-geral')"
+                    style="color: white;">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <div class="producao-kpi-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <div class="producao-kpi-card" onclick="openDespesasListaModal()"
+                        style="cursor: pointer; border-left-color: #e65100; background: linear-gradient(135deg, #e65100, #bf360c);">
+                        <span class="kpi-label">Gasto Real (Confirmado)</span>
+                        <span class="kpi-value" id="total-previsao-despesas">R$ 0,00</span>
+                        <span class="kpi-subtext"><i class="fas fa-search-plus"></i> Ver detalhamento real</span>
+                    </div>
+                    <div class="producao-kpi-card"
+                        style="border-left-color: #546e7a; background: linear-gradient(135deg, #78909c, #546e7a);">
+                        <span class="kpi-label">Pipeline de Despesas (Reservas)</span>
+                        <span class="kpi-value" id="total-previsao-despesas-pipeline">R$ 0,00</span>
+                        <span class="kpi-subtext"><i class="fas fa-info-circle"></i> Previsão para reservas</span>
+                    </div>
+                </div>
+                <div class="producao-chart-section">
+                    <div class="chart-container-wrapper" style="height: 400px;">
+                        <canvas id="chartDespesasTurmas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 7: Detalhamento de Despesas (Lista) -->
+    <div id="modal-despesas-lista" class="modal-producao">
+        <div class="modal-producao-content animate-pop-in">
+            <div class="modal-producao-header" style="background: #bf360c; color: white;">
+                <h3><i class="fas fa-list-ul"></i> Detalhamento de Despesas</h3>
+                <button class="modal-producao-close" onclick="closeFinanceiroModal('modal-despesas-lista')"
+                    style="color: white;">&times;</button>
+            </div>
+            <div class="modal-producao-body">
+                <div id="lista-despesas-turmas" class="turmas-producao-list" style="max-height: 500px; overflow-y: auto;">
+                    <!-- Preenchido via JS -->
+                </div>
+            </div>
+            <div class="modal-producao-footer" style="justify-content: center;">
+                <button class="btn btn-secondary" onclick="backToDespesasGeral()"><i class="fas fa-arrow-left"></i>
+                    Voltar ao Gráfico</button>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="js/dashboard_simulation.js"></script>
+<?php endif; ?>
+
+<?php if (!isset($_GET['ajax_render'])): ?>
+    <script>
+        window.__docentesData = <?= json_encode(mysqli_fetch_all(mysqli_query($conn, "SELECT id, nome, area_conhecimento FROM docente WHERE ativo = 1 ORDER BY nome ASC"), MYSQLI_ASSOC)) ?>;
+
+        function setDashboardViewMode(mode) {
+            localStorage.setItem('dashboard_view_mode', mode);
+            applyDashboardViewMode(mode);
+        }
+
+        function applyDashboardViewMode(mode) {
+            const container = document.getElementById('dashboard-ajax-content');
+            const btnGeral = document.getElementById('btn-toggle-geral');
+            const btnTimeline = document.getElementById('btn-toggle-timeline');
+            const btnTurmas = document.getElementById('btn-toggle-turmas');
+            if (!container) return;
+
+            const isSecretaria = <?= isSecretaria() ? 'true' : 'false' ?>;
+            if (isSecretaria) {
+                mode = 'turmas';
+            } else if (mode !== 'timeline' && mode !== 'turmas' && mode !== 'geral') {
+                mode = 'geral';
+            }
+
+            container.classList.remove('view-mode-geral', 'view-mode-timeline', 'view-mode-turmas');
+            container.classList.add('view-mode-' + mode);
+
+            if (btnGeral) btnGeral.classList.toggle('active', mode === 'geral');
+            if (btnTimeline) btnTimeline.classList.toggle('active', mode === 'timeline');
+            if (btnTurmas) btnTurmas.classList.toggle('active', mode === 'turmas');
+        }
+
+        function navigateDashboardMonth(offset) {
+            const input = document.getElementById('mes_sel_hidden');
+            if (!input) return;
+            const [year, month] = input.value.split('-').map(Number);
+            const date = new Date(year, month - 1 + offset, 1);
+            input.value = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0');
+            refreshDashboardAjax();
+        }
+
+        function navigateProximasTurmas(delta) {
+            const input = document.getElementById('proximas_page_hidden');
+            if (!input) return;
+            input.value = (parseInt(input.value) || 1) + delta;
+            refreshDashboardAjax();
+        }
+
+        function setTipoCursoFilter(tipo) {
+            const input = document.getElementById('tipo_curso_hidden');
+            if (input) {
+                input.value = tipo;
+            }
+            const proxPage = document.getElementById('proximas_page_hidden');
+            if (proxPage) proxPage.value = 1;
+            const profPage = document.getElementById('prof_page_hidden');
+            if (profPage) profPage.value = 1;
+            refreshDashboardAjax();
+        }
+
+        function refreshDashboardAjax() {
+            const form = document.getElementById('dashboard-filter-form');
+            if (!form) return;
+            const formData = new FormData(form);
+            const params = new URLSearchParams(formData);
+            params.set('ajax_render', '1');
+
+            const container = document.getElementById('dashboard-ajax-content');
+            if (container) container.style.opacity = '0.5';
+
+            fetch('index.php?' + params.toString())
+                .then(r => r.text())
+                .then(html => {
+                    const temp = document.createElement('div');
+                    temp.innerHTML = html;
+                    const newContent = temp.querySelector('#dashboard-ajax-content');
+                    if (newContent && container) {
+                        container.innerHTML = newContent.innerHTML;
+                        container.style.opacity = '1';
+                        const displayParams = new URLSearchParams(formData);
+                        window.history.pushState({}, '', 'index.php?' + displayParams.toString());
+                        initDashboardScripts();
+                    }
+                })
+                .catch(err => {
+                    console.error('Erro AJAX:', err);
+                    if (container) container.style.opacity = '1';
+                });
+        }
+
+        function initDashboardScripts() {
+            applyDashboardViewMode(localStorage.getItem('dashboard_view_mode') || 'geral');
+
+            const mesInput = document.getElementById('mes_sel_hidden');
+            if (!mesInput) return;
+            const currentMonth = parseInt(mesInput.value.split('-')[1]);
+
+            document.querySelectorAll('.timeline-grid').forEach(grid => {
+                const target = grid.querySelector('.month-group[data-month="' + currentMonth + '"]');
+                if (target) grid.scrollLeft = target.offsetLeft;
+            });
+
+            const form = document.getElementById('dashboard-filter-form');
+            if (form) form.onsubmit = e => { e.preventDefault(); navigateDashboardMonth(0); };
+
+            // Modal de Seleção de Professor
+            const btnSel = document.getElementById('btn-selecionar-professor');
+            const profModal = document.getElementById('modal-selecionar-professor');
+            const profSearchInput = document.getElementById('prof-search-input');
+            const profSearchResults = document.getElementById('prof-search-results');
+            const docentes = window.__docentesData || [];
+
+            if (btnSel) {
+                btnSel.onclick = () => {
+                    if (profModal) {
+                        profModal.classList.add('active');
+                        if (profSearchInput) profSearchInput.value = '';
+                        renderModalResults();
+                        setTimeout(() => profSearchInput?.focus(), 100);
+                    }
+                };
+            }
+
+            const closeBtn = document.getElementById('modal-prof-close');
+            if (closeBtn) closeBtn.onclick = () => { if (profModal) profModal.classList.remove('active'); };
+            if (profModal) profModal.onclick = (e) => { if (e.target === profModal) profModal.classList.remove('active'); };
+
+            function renderModalResults() {
+                if (!profSearchResults) return;
+                const query = (profSearchInput?.value || '').toLowerCase().trim();
+                let filtered = docentes.filter(d => !query || d.nome.toLowerCase().includes(query));
+
+                if (filtered.length === 0) {
+                    profSearchResults.innerHTML = '<div style="text-align:center; padding:20px; color:#888;">Nenhum professor encontrado.</div>';
+                    return;
+                }
+
+                profSearchResults.innerHTML = filtered.map(d => `
+            <div class="prof-result-item" data-id="${d.id}" data-nome="${d.nome.replace(/"/g, '&quot;')}" 
+                style="padding: 10px; border-bottom: 1px solid var(--border-color); cursor: pointer; display: flex; justify-content: space-between; align-items: center; transition: background 0.2s;">
+                <div>
+                    <strong style="font-size: 0.95rem;">${d.nome}</strong><br>
+                    <small style="color: #888; font-size: 0.75rem;">${d.area_conhecimento || 'Outros'}</small>
+                </div>
+                <i class="fas fa-chevron-right" style="color: #ccc; font-size: 0.8rem;"></i>
+            </div>
+        `).join('');
+
+        profSearchResults.querySelectorAll('.prof-result-item').forEach(item => {
+            item.onclick = function () {
+                const hId = document.getElementById('dashboard-docente-id');
+                const bLabel = document.getElementById('btn-prof-label');
+                const bSel = document.getElementById('btn-selecionar-professor');
+                if (hId) hId.value = this.dataset.id;
+                if (bLabel) bLabel.textContent = this.dataset.nome;
+                if (bSel) { bSel.style.background = '#2e7d32'; bSel.style.borderColor = '#1b5e20'; }
+                if (profModal) profModal.classList.remove('active');
+                navigateDashboardMonth(0);
+            };
+        });
+    }
+
+    if (profSearchInput) profSearchInput.oninput = renderModalResults;
+}
+
+function clearTeacherFilter() {
+    const hId = document.getElementById('dashboard-docente-id');
+    const bLabel = document.getElementById('btn-prof-label');
+    const bSel = document.getElementById('btn-selecionar-professor');
+    if (hId) hId.value = '';
+    if (bLabel) bLabel.textContent = 'Selecionar Professor';
+    if (bSel) { bSel.style.background = '#ed1c16'; bSel.style.borderColor = '#ed1c16'; }
+    navigateDashboardMonth(0);
+}
+
+document.addEventListener('DOMContentLoaded', initDashboardScripts);
+</script>
+<?php endif; ?>
+
+<?php if (!isSecretaria()): ?>
+
+
+<div id="modal-substituicao-gera" class="modal-subst">
+    <div class="modal-subst-content">
+        <div class="modal-subst-header">
+            <h3><i class="fas fa-user-clock"></i> Substituição Temporária</h3>
+            <button class="modal-subst-close" onclick="closeSubstituicaoModal()">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="modal-subst-body">
+            <!-- PASSO 1: ONDE E QUEM -->
+            <div class="subst-step-title">1. Identifique a Turma e o Docente Titular</div>
+            <div class="subst-filter-grid"
+                style="margin-bottom: 20px; background: rgba(0,90,165,0.05); border-color: var(--subst-primary);">
+                <div class="subst-filter-item">
+                    <label>Turma</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="subst-turma-display" class="subst-input" readonly
+                            placeholder="Selecione uma turma..." style="flex: 1; cursor: pointer;"
+                            onclick="abrirPesquisaTurma()">
+                        <input type="hidden" id="subst-turma-id" value="">
+                        <button type="button" class="subst-btn-icon" onclick="abrirPesquisaTurma()"
+                            title="Pesquisar Turma">
+                            <i class="fas fa-search"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="subst-filter-item">
+                    <label>Docente a ser Substituído</label>
+                    <select id="subst-titular-select" class="subst-input" disabled onchange="onTitularChange(this)">
+                        <option value="">-- Selecione a Turma Primeiro --</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- PASSO 2: CONFIGURAÇÕES -->
+            <div id="subst-step-2" style="opacity: 0.5; pointer-events: none; transition: 0.3s;">
+                <div class="subst-step-title">2. Configure o Período e a Área</div>
+                <div class="subst-filter-grid">
+                    <div class="subst-filter-item">
+                        <label>Área do Docente</label>
+                        <select id="subst-area" class="subst-input">
+                            <option value="">Todas as Áreas</option>
+                            <?php foreach ($areas_list as $area): ?>
+                            <option value="<?= htmlspecialchars($area['area_conhecimento']) ?>">
+                                <?= htmlspecialchars($area['area_conhecimento']) ?>
+                            </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="subst-filter-item">
+                        <label>Período</label>
+                        <select id="subst-periodo" class="subst-input">
+                            <option value="Manhã">Manhã</option>
+                            <option value="Tarde">Tarde</option>
+                            <option value="Noite">Noite</option>
+                            <option value="Integral">Integral</option>
+                        </select>
+                    </div>
+                    <div class="subst-filter-item">
+                        <label>Data Inicial</label>
+                        <input type="date" id="subst-data-inicio" class="subst-input" value="<?= date('Y-m-d') ?>">
+                    </div>
+                    <div class="subst-filter-item">
+                        <label>Data Final</label>
+                        <input type="date" id="subst-data-fim" class="subst-input" value="<?= date('Y-m-d') ?>">
+                    </div>
+                    <button class="subst-btn-search" onclick="buscarProfessoresDisponiveis()">
+                        <i class="fas fa-search"></i> Encontrar Substitutos Disponíveis
+                    </button>
+                </div>
+            </div>
+
+            <!-- PASSO 3: RESULTADOS -->
+            <div id="subst-results-wrapper" style="display:none;">
+                <div class="subst-step-title">3. Selecione o Professor Substituto</div>
+                <div id="subst-results" class="subst-results-container">
+                    <div style="padding: 20px; text-align: center; color: var(--subst-text-muted);">
+                        Buscando professores disponíveis...
+                    </div>
+                </div>
+            </div>
+
+            <!-- PASSO 4: CONFIRMAÇÃO -->
+            <div id="subst-confirmation" class="subst-confirmation-panel" style="display:none;">
+                <div class="subst-confirmation-header">
+                    <i class="fas fa-check-circle" style="color: var(--subst-success);"></i>
+                    Confirmar Substituição Temporária
+                </div>
+                <p style="font-size: 0.85rem; color: #888; margin-bottom: 20px;">
+                    Ao confirmar, o sistema alterará a agenda da turma no período selecionado.
+                </p>
+                <button class="subst-btn-confirm" onclick="confirmarSubstituicao()">
+                    Confirmar Substituição
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Interna: Pesquisa de Turmas -->
+<div id="modal-pesquisa-turma" class="modal-subst" style="z-index: 6000;">
+    <div class="modal-subst-content" style="max-width: 600px; margin-top: 80px;">
+        <div class="modal-subst-header" style="background: #333;">
+            <h3><i class="fas fa-search"></i> Pesquisar Turma</h3>
+            <button class="modal-subst-close" onclick="fecharPesquisaTurma()"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-subst-body">
+            <input type="text" id="input-busca-turma" class="subst-input" placeholder="Digite a sigla ou curso..."
+                style="width: 100%; margin-bottom: 15px;" oninput="filtrarListaTurmas(this.value)">
+            <div id="lista-turmas-pesquisa"
+                style="max-height: 400px; overflow-y: auto; border: 1px solid var(--subst-border); border-radius: 8px;">
+                <!-- Preenchido via JS -->
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- ============================================================ -->
+<!-- MODAIS DE METAS E CUSTOS A/H -->
+<!-- ============================================================ -->
+
+<!-- Modal 1: Metas de Ensino -->
+<div id="modal-metas-ensino" class="modal-producao">
+    <div class="modal-producao-content" style="max-width: 500px;">
+        <div class="modal-producao-header">
+            <h3><i class="fas fa-edit"></i> 1. Metas de Ensino</h3>
+            <button class="modal-producao-close" onclick="closeMetasModal('modal-metas-ensino')">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="modal-producao-body">
+            <p style="font-size: 0.85rem; color: #666; margin-bottom: 20px;">Defina a produção total (A/H) esperada para
+                cada modalidade no ano selecionado.</p>
+
+            <div style="display: flex; flex-direction: column; gap: 15px;">
+                <div class="meta-input-group">
+                    <label>CAI (Aprendizagem Industrial)</label>
+                    <input type="number" id="meta-cai-horas" placeholder="Produção Total (A/H)" class="form-control">
+                </div>
+                <div class="meta-input-group">
+                    <label>CT (Cursos Técnicos)</label>
+                    <input type="number" id="meta-ct-horas" placeholder="Produção Total (A/H)" class="form-control">
+                </div>
+                <div class="meta-input-group">
+                    <label
+                        style="font-weight: 800; color: #004d40; border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 4px; margin-bottom: 8px; display: block;">FIC
+                        (Formação Inicial e Continuada)</label>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; padding-left: 5px;">
+                        <div>
+                            <label style="font-size: 0.65rem;">FIC Balcão</label>
+                            <input type="number" id="meta-fic-balcao-horas" placeholder="A/H" class="form-control"
+                                style="padding: 8px;">
+                        </div>
+                        <div>
+                            <label style="font-size: 0.65rem;">FIC Empresa</label>
+                            <input type="number" id="meta-fic-empresa-horas" placeholder="A/H" class="form-control"
+                                style="padding: 8px;">
+                        </div>
+                        <div>
+                            <label style="font-size: 0.65rem;">FIC Entidade</label>
+                            <input type="number" id="meta-fic-entidade-horas" placeholder="A/H" class="form-control"
+                                style="padding: 8px;">
+                        </div>
+                    </div>
+                    <input type="hidden" id="meta-fic-horas" value="0">
+                </div>
+            </div>
+
+            <div style="margin-top: 30px; display: flex; justify-content: flex-end;">
+                <button class="btn btn-primary btn-meta-action" onclick="nextToDespesas()">
+                    Próximo: Despesas <i class="fas fa-arrow-right"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal 2: Despesas -->
+<div id="modal-metas-despesas" class="modal-producao">
+    <div class="modal-producao-content" style="max-width: 500px;">
+        <div class="modal-producao-header">
+            <h3><i class="fas fa-money-bill-wave"></i> 2. Despesas do Ano</h3>
+            <button class="modal-producao-close" onclick="closeMetasModal('modal-metas-despesas')">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="modal-producao-body">
+            <div
+                style="background: #e0f2f1; padding: 20px; border-radius: 12px; margin-bottom: 25px; border: 1px solid #b2dfdb;">
+                <div
+                    style="font-size: 0.75rem; text-transform: uppercase; color: #00796b; font-weight: 800; letter-spacing: 0.5px;">
+                    Volume de A/H Esperado (Variável X)</div>
+                <div style="font-size: 1.8rem; font-weight: 900; color: #004d40;"><span
+                        id="display-total-ah-meta">0</span> A/H</div>
+            </div>
+
+            <div class="meta-input-group">
+                <label>Valor da Despesa Anual (R$)</label>
+                <input type="number" id="meta-despesa-anual" step="0.01" class="form-control"
+                    placeholder="Ex: 2.000.000,00">
+            </div>
+
+            <div style="margin-top: 30px; display: flex; justify-content: space-between;">
+                <button class="btn btn-export btn-meta-action" onclick="openMetasModal('modal-metas-ensino')">
+                    <i class="fas fa-arrow-left"></i> Voltar
+                </button>
+                <button class="btn btn-primary btn-meta-action" onclick="saveAllMetas()">
+                    Salvar e Ver Dashboard <i class="fas fa-check"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal 3: Dashboard Principal -->
+<div id="modal-metas-dashboard" class="modal-producao">
+    <div class="modal-producao-content" style="max-width: 1000px; width: 95%;">
+        <div class="modal-producao-header">
+            <div style="display: flex; align-items: center; gap: 20px;">
+                <h3><i class="fas fa-chart-bar"></i> Gestão de Metas e Custos A/H</h3>
+                <span class="meta-year-badge">
+                    Ano
+                    <?= date('Y') ?>
+                </span>
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-primary btn-sm btn-meta-action" onclick="openMetasSimulationModal()"
+                    id="btn-simulate">
+                    <i class="fas fa-vial"></i> Simular
+                </button>
+                <button class="btn btn-primary btn-sm btn-meta-action" onclick="changeMetasVision()"
+                    id="btn-change-vision">
+                    <i class="fas fa-compress-alt"></i> Visão Geral
+                </button>
+                <?php if (isAdmin() || isGestor()): ?>
+                <button type="button" class="btn btn-primary btn-sm btn-meta-action"
+                    onclick="event.preventDefault(); openEditMetas();">
+                    <i class="fas fa-edit"></i> Editar
+                </button>
+                <?php endif; ?>
+                <button class="modal-producao-close" onclick="closeMetasModal('modal-metas-dashboard')">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        </div>
+        <div class="modal-producao-body">
+            <div class="metas-cards-grid"
+                style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 30px;">
+                <div class="meta-card-info"
+                    style="padding: 25px; border-radius: 16px; border-left: 6px solid var(--meta-primary);">
+                    <div style="font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;">
+                        Custo A/H (Meta)</div>
+                    <div id="card-custo-meta"
+                        style="font-size: 2rem; font-weight: 900; color: var(--meta-primary); margin: 5px 0;">R$ 0,00
+                    </div>
+                    <div id="card-volume-meta" style="font-size: 0.9rem; font-weight: 600;">0 A/H Esperados</div>
+                </div>
+                <div class="meta-card-info"
+                    style="padding: 25px; border-radius: 16px; border-left: 6px solid var(--meta-secondary);">
+                    <div style="font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;">
+                        Custo A/H (Realizado)</div>
+                    <div id="card-custo-real"
+                        style="font-size: 2rem; font-weight: 900; color: var(--meta-secondary); margin: 5px 0;">R$ 0,00
+                    </div>
+                    <div id="card-volume-real" style="font-size: 0.9rem; font-weight: 600;">0 A/H Realizados</div>
+                </div>
+            </div>
+
+            <div class="meta-chart-container"
+                style="padding: 25px; border-radius: 16px; height: 420px; border: 1px solid var(--meta-border); background: var(--meta-card-bg);">
+                <canvas id="chartMetasComparison"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="modal-metas-simulacao" class="modal-producao">
+    <div class="modal-producao-content" style="max-width: 900px;">
+        <div class="modal-producao-header" style="background: var(--meta-accent); border-bottom: none;">
+            <h3><i class="fas fa-vial"></i> Ferramenta de Simulação</h3>
+            <button class="modal-producao-close" onclick="closeMetasSimulation()">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="modal-producao-body">
+            <p style="font-size: 0.85rem; color: #666; margin-bottom: 25px;">Ajuste os valores para ver como o custo A/H
+                se comporta em diferentes cenários.</p>
+
+            <div style="display: grid; grid-template-columns: 1fr 1.5fr; gap: 30px;">
+                <div style="display: flex; flex-direction: column; gap: 20px;">
+                    <div class="meta-input-group">
+                        <label
+                            style="font-size: 0.75rem; font-weight: 800; color: var(--text-muted); text-transform: uppercase;">Despesa
+                            Base Existente (Y)</label>
+                        <input type="number" id="sim-despesa-base" class="form-control" readonly
+                            style="padding: 8px; background: rgba(0,0,0,0.2); color: #aaa; cursor: not-allowed;">
+                    </div>
+                    <div class="meta-input-group" style="margin-top: -10px;">
+                        <label
+                            style="font-size: 0.75rem; font-weight: 800; color: var(--meta-accent); text-transform: uppercase;">Adicionar
+                            Despesa Simulada (+R$)</label>
+                        <input type="number" id="sim-add-despesa" class="form-control" placeholder="0"
+                            oninput="updateMetasSimulation()" style="padding: 8px; border-color: var(--meta-accent);">
+                    </div>
+
+                    <div style="border-top: 1px solid var(--meta-border); padding-top: 15px; margin-top: 5px;">
+                        <label
+                            style="font-size: 0.75rem; font-weight: 800; color: var(--text-muted); text-transform: uppercase; margin-bottom: 8px; display: block;">
+                            Produção do Sistema (Base Fixa)
+                        </label>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px;">
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">CAI</label>
+                                <input type="number" id="sim-base-cai" class="form-control" readonly
+                                    style="padding: 8px; background: rgba(0,0,0,0.2); color: #aaa; cursor: not-allowed;">
+                            </div>
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">TÉCNICO</label>
+                                <input type="number" id="sim-base-ct" class="form-control" readonly
+                                    style="padding: 8px; background: rgba(0,0,0,0.2); color: #aaa; cursor: not-allowed;">
+                            </div>
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">FIC</label>
+                                <input type="number" id="sim-base-fic" class="form-control" readonly
+                                    style="padding: 8px; background: rgba(0,0,0,0.2); color: #aaa; cursor: not-allowed;">
+                            </div>
+                        </div>
+
+                        <label
+                            style="font-size: 0.75rem; font-weight: 800; color: var(--meta-accent); text-transform: uppercase; margin-bottom: 8px; display: block;">
+                            Adicionar Produção Simulada (+A/H)
+                        </label>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">+ CAI</label>
+                                <input type="number" id="sim-add-cai" class="form-control" placeholder="0"
+                                    oninput="updateMetasSimulation()"
+                                    style="padding: 8px; border-color: var(--meta-accent);">
+                            </div>
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">+ TÉCNICO</label>
+                                <input type="number" id="sim-add-ct" class="form-control" placeholder="0"
+                                    oninput="updateMetasSimulation()"
+                                    style="padding: 8px; border-color: var(--meta-accent);">
+                            </div>
+                            <div class="meta-input-group">
+                                <label style="font-size: 0.65rem;">+ FIC</label>
+                                <input type="number" id="sim-add-fic" class="form-control" placeholder="0"
+                                    oninput="updateMetasSimulation()"
+                                    style="padding: 8px; border-color: var(--meta-accent);">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="simulation-panel animate-fade-in"
+                        style="display: grid; grid-template-columns: 1fr; gap: 15px; background: rgba(106, 27, 154, 0.05); padding: 20px; border-radius: 12px; border: 1px dashed var(--meta-accent); margin-top: 10px;">
+                        <div style="margin-bottom: 5px;">
+                            <div class="simulation-result-label">PRODUÇÃO TOTAL SIMULADA</div>
+                            <div id="sim-resultado-producao"
+                                style="font-size: 1.2rem; font-weight: 800; color: var(--meta-accent);">0 A/H</div>
+                        </div>
+                        <div style="margin-bottom: 5px;">
+                            <div class="simulation-result-label">CUSTO SIMULADO</div>
+                            <div id="sim-resultado-custo" class="simulation-result-value"
+                                style="color: var(--meta-accent); font-size: 1.8rem;">R$ 0,00</div>
+                        </div>
+                        <div>
+                            <div class="simulation-result-label">ATINGIMENTO DA META</div>
+                            <div id="sim-resultado-atingimento" class="simulation-result-value"
+                                style="color: var(--meta-accent);">0%</div>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 10px; text-align: center;">
+                        <button class="btn btn-export btn-meta-action" onclick="closeMetasSimulation()"
+                            style="width: 100%;">
+                            Encerrar Simulação
+                        </button>
+                    </div>
+                </div>
+
+                <div class="meta-chart-container"
+                    style="background: var(--meta-card-bg); border: 1px solid var(--meta-border); border-radius: 16px; padding: 20px; height: 100%; min-height: 350px;">
+                    <canvas id="chartSimulacao"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php if (!isset($_GET['ajax_render'])): ?>
+<script>
+    (function () {
+        fetch('php/scripts/cron_diarios.php?token=90f61127-5259-4aed-b1ef-e01e163eac4f')
+            .catch(err => console.error('Erro cron:', err));
+    })();
+</script>
+<?php endif; ?>
+
+<?php include __DIR__ . '/php/components/footer.php'; ?>
